@@ -187,14 +187,14 @@ static pa_bluetooth_form_factor_t form_factor_from_class(uint32_t class_of_devic
         case 4:
             break;
         default:
-            pa_log_debug("Unknown Bluetooth major device class %u", major);
+            pa_log_notice("Unknown Bluetooth major device class %u", major);
             return PA_BLUETOOTH_FORM_FACTOR_UNKNOWN;
     }
 
     r = minor < PA_ELEMENTSOF(table) ? table[minor] : PA_BLUETOOTH_FORM_FACTOR_UNKNOWN;
 
     if (!r)
-        pa_log_debug("Unknown Bluetooth minor device class %u", minor);
+        pa_log_notice("Unknown Bluetooth minor device class %u", minor);
 
     return r;
 }
@@ -290,7 +290,7 @@ static int sco_process_render(struct userdata *u) {
         if (saved_errno == EAGAIN) {
             /* Hmm, apparently the socket was not writable, give up for now.
              * Because the data was already rendered, let's discard the block. */
-            pa_log_debug("Got EAGAIN on write() after POLLOUT, probably there is a temporary connection loss.");
+            pa_log_notice("Got EAGAIN on write() after POLLOUT, probably there is a temporary connection loss.");
             return 1;
         }
 
@@ -472,7 +472,7 @@ static int a2dp_write_buffer(struct userdata *u, size_t nbytes) {
 
             else if (errno == EAGAIN) {
                 /* Hmm, apparently the socket was not writable, give up for now */
-                pa_log_debug("Got EAGAIN on write() after POLLOUT, probably there is a temporary connection loss.");
+                pa_log_notice("Got EAGAIN on write() after POLLOUT, probably there is a temporary connection loss.");
                 break;
             }
 
@@ -673,7 +673,7 @@ static void update_sink_buffer_size(struct userdata *u) {
             if (ret == -1)
                 pa_log_warn("Changing bluetooth buffer size: Failed to change from %d to %d: %s", old_bufsize / 2, new_bufsize, pa_cstrerror(errno));
             else
-                pa_log_info("Changing bluetooth buffer size: Changed from %d to %d", old_bufsize / 2, new_bufsize);
+                pa_log_notice("Changing bluetooth buffer size: Changed from %d to %d", old_bufsize / 2, new_bufsize);
         }
     }
 }
@@ -699,7 +699,7 @@ static void teardown_stream(struct userdata *u) {
         pa_memchunk_reset(&u->write_memchunk);
     }
 
-    pa_log_debug("Audio stream torn down");
+    pa_log_notice("Audio stream torn down");
     u->stream_setup_done = false;
 }
 
@@ -709,7 +709,7 @@ static int transport_acquire(struct userdata *u, bool optional) {
     if (u->transport_acquired)
         return 0;
 
-    pa_log_debug("Acquiring transport %s", u->transport->path);
+    pa_log_notice("Acquiring transport %s", u->transport->path);
 
     u->stream_fd = u->transport->acquire(u->transport, optional, &u->read_link_mtu, &u->write_link_mtu);
     if (u->stream_fd < 0)
@@ -718,7 +718,7 @@ static int transport_acquire(struct userdata *u, bool optional) {
     /* transport_acquired must be set before calling
      * pa_bluetooth_transport_set_state() */
     u->transport_acquired = true;
-    pa_log_info("Transport %s acquired: fd %d", u->transport->path, u->stream_fd);
+    pa_log_notice("Transport %s acquired: fd %d", u->transport->path, u->stream_fd);
 
     if (u->transport->state == PA_BLUETOOTH_TRANSPORT_STATE_IDLE) {
         if (pa_thread_mq_get() != NULL)
@@ -737,7 +737,7 @@ static void transport_release(struct userdata *u) {
     if (!u->transport_acquired)
         return;
 
-    pa_log_debug("Releasing transport %s", u->transport->path);
+    pa_log_notice("Releasing transport %s", u->transport->path);
 
     u->transport->release(u->transport);
 
@@ -779,12 +779,12 @@ static void transport_config_mtu(struct userdata *u) {
         u->write_block_size = u->write_link_mtu;
 
         if (!pa_frame_aligned(u->read_block_size, &u->source->sample_spec)) {
-            pa_log_debug("Got invalid read MTU: %lu, rounding down", u->read_block_size);
+            pa_log_notice("Got invalid read MTU: %lu, rounding down", u->read_block_size);
             u->read_block_size = pa_frame_align(u->read_block_size, &u->source->sample_spec);
         }
 
         if (!pa_frame_aligned(u->write_block_size, &u->sink->sample_spec)) {
-            pa_log_debug("Got invalid write MTU: %lu, rounding down", u->write_block_size);
+            pa_log_notice("Got invalid write MTU: %lu, rounding down", u->write_block_size);
             u->write_block_size = pa_frame_align(u->write_block_size, &u->sink->sample_spec);
         }
     } else {
@@ -817,7 +817,7 @@ static int setup_stream(struct userdata *u) {
     if (u->stream_setup_done)
         return 0;
 
-    pa_log_info("Transport %s resuming", u->transport->path);
+    pa_log_notice("Transport %s resuming", u->transport->path);
 
     if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
         pa_assert(u->a2dp_codec);
@@ -838,7 +838,7 @@ static int setup_stream(struct userdata *u) {
     if (setsockopt(u->stream_fd, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof(one)) < 0)
         pa_log_warn("Failed to enable SO_TIMESTAMP: %s", pa_cstrerror(errno));
 
-    pa_log_debug("Stream properly set up, we're ready to roll!");
+    pa_log_notice("Stream properly set up, we're ready to roll!");
 
     u->rtpoll_item = pa_rtpoll_item_new(u->rtpoll, PA_RTPOLL_NEVER, 1);
     pollfd = pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL);
@@ -903,7 +903,7 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
                is such that this kind of unnecessary setup_stream()
                calls can happen. */
             if (u->stream_fd < 0)
-                pa_log_debug("Skip source stream setup while closing");
+                pa_log_notice("Skip source stream setup while closing");
             else
                 setup_stream(u);
             return 0;
@@ -1103,7 +1103,7 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
                is such that this kind of unnecessary setup_stream()
                calls can happen. */
             if (u->stream_fd < 0)
-                pa_log_debug("Skip sink stream setup while closing");
+                pa_log_notice("Skip sink stream setup while closing");
             else
                 setup_stream(u);
             return 0;
@@ -1403,7 +1403,7 @@ static void thread_func(void *userdata) {
     pa_assert(u);
     pa_assert(u->transport);
 
-    pa_log_debug("IO Thread starting up");
+    pa_log_notice("IO Thread starting up");
 
     if (u->core->realtime_scheduling)
         pa_thread_make_realtime(u->core->realtime_priority);
@@ -1426,7 +1426,7 @@ static void thread_func(void *userdata) {
 
         /* Check for stream error or close */
         if (pollfd && (pollfd->revents & ~(POLLOUT|POLLIN))) {
-            pa_log_info("FD error: %s%s%s%s",
+            pa_log_notice("FD error: %s%s%s%s",
                         pollfd->revents & POLLERR ? "POLLERR " :"",
                         pollfd->revents & POLLHUP ? "POLLHUP " :"",
                         pollfd->revents & POLLPRI ? "POLLPRI " :"",
@@ -1538,7 +1538,7 @@ static void thread_func(void *userdata) {
                             skip_bytes = bytes_to_send - 2 * u->write_block_size;
                             skip_usec = pa_bytes_to_usec(skip_bytes, &u->encoder_sample_spec);
 
-                            pa_log_debug("Skipping %llu us (= %llu bytes) in audio stream",
+                            pa_log_notice("Skipping %llu us (= %llu bytes) in audio stream",
                                         (unsigned long long) skip_usec,
                                         (unsigned long long) skip_bytes);
 
@@ -1615,12 +1615,12 @@ static void thread_func(void *userdata) {
             pa_rtpoll_set_timer_disabled(u->rtpoll);
 
         if ((ret = pa_rtpoll_run(u->rtpoll)) < 0) {
-            pa_log_debug("pa_rtpoll_run failed with: %d", ret);
+            pa_log_notice("pa_rtpoll_run failed with: %d", ret);
             goto fail;
         }
 
         if (ret == 0) {
-            pa_log_debug("IO thread shutdown requested, stopping cleanly");
+            pa_log_notice("IO thread shutdown requested, stopping cleanly");
             transport_release(u);
             goto finish;
         }
@@ -1628,12 +1628,12 @@ static void thread_func(void *userdata) {
 
 fail:
     /* If this was no regular exit from the loop we have to continue processing messages until we receive PA_MESSAGE_SHUTDOWN */
-    pa_log_debug("IO thread failed");
+    pa_log_notice("IO thread failed");
     pa_asyncmsgq_post(pa_thread_mq_get()->outq, PA_MSGOBJECT(u->msg), BLUETOOTH_MESSAGE_IO_THREAD_FAILED, NULL, 0, NULL, NULL);
     pa_asyncmsgq_wait_for(u->thread_mq.inq, PA_MESSAGE_SHUTDOWN);
 
 finish:
-    pa_log_debug("IO thread shutting down");
+    pa_log_notice("IO thread shutting down");
 }
 
 /* Run from main thread */
@@ -2106,12 +2106,12 @@ static int add_card(struct userdata *u) {
         pa_bluetooth_profile_t profile;
 
         if (!enable_native_hfp_hf && pa_streq(uuid, PA_BLUETOOTH_UUID_HFP_HF)) {
-            pa_log_info("device supports HFP but disabling profile as requested");
+            pa_log_notice("device supports HFP but disabling profile as requested");
             continue;
         }
 
         if (has_both && pa_streq(uuid, PA_BLUETOOTH_UUID_HSP_HS)) {
-            pa_log_info("device support HSP and HFP, selecting HFP only");
+            pa_log_notice("device support HSP and HFP, selecting HFP only");
             continue;
         }
 
@@ -2178,7 +2178,7 @@ static void handle_transport_state_change(struct userdata *u, struct pa_bluetoot
 
     if (acquire && transport_acquire(u, true) >= 0) {
         if (u->source) {
-            pa_log_debug("Resuming source %s because its transport state changed to playing", u->source->name);
+            pa_log_notice("Resuming source %s because its transport state changed to playing", u->source->name);
 
             /* When the ofono backend resumes source or sink when in the audio gateway role, the
              * state of source or sink may already be RUNNING before the transport is acquired via
@@ -2199,7 +2199,7 @@ static void handle_transport_state_change(struct userdata *u, struct pa_bluetoot
         }
 
         if (u->sink) {
-            pa_log_debug("Resuming sink %s because its transport state changed to playing", u->sink->name);
+            pa_log_notice("Resuming sink %s because its transport state changed to playing", u->sink->name);
 
             /* Same comment as above */
             if (PA_SINK_IS_OPENED(u->sink->state))
@@ -2218,12 +2218,12 @@ static void handle_transport_state_change(struct userdata *u, struct pa_bluetoot
 
         /* Remote side closed the stream so we consider it PA_SUSPEND_USER */
         if (u->source) {
-            pa_log_debug("Suspending source %s because the remote end closed the stream", u->source->name);
+            pa_log_notice("Suspending source %s because the remote end closed the stream", u->source->name);
             pa_source_suspend(u->source, true, PA_SUSPEND_USER);
         }
 
         if (u->sink) {
-            pa_log_debug("Suspending sink %s because the remote end closed the stream", u->sink->name);
+            pa_log_notice("Suspending sink %s because the remote end closed the stream", u->sink->name);
             pa_sink_suspend(u->sink, true, PA_SUSPEND_USER);
         }
     }
@@ -2237,7 +2237,7 @@ static pa_hook_result_t device_connection_changed_cb(pa_bluetooth_discovery *y, 
     if (d != u->device || pa_bluetooth_device_any_transport_connected(d))
         return PA_HOOK_OK;
 
-    pa_log_debug("Unloading module for device %s", d->path);
+    pa_log_notice("Unloading module for device %s", d->path);
     pa_module_unload(u->module, true);
 
     return PA_HOOK_OK;
@@ -2324,7 +2324,7 @@ static int device_process_msg(pa_msgobject *obj, int code, void *data, int64_t o
             if (m->card->module->unload_requested)
                 break;
 
-            pa_log_debug("Switching the profile to off due to IO thread failure.");
+            pa_log_notice("Switching the profile to off due to IO thread failure.");
             pa_assert_se(pa_card_set_profile(m->card, pa_hashmap_get(m->card->profiles, "off"), false) >= 0);
             break;
         case BLUETOOTH_MESSAGE_STREAM_FD_HUP:

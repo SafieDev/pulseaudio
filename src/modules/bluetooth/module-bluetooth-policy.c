@@ -92,7 +92,7 @@ static pa_hook_result_t source_put_hook_callback(pa_core *c, pa_source *source, 
               pa_streq(s, "handsfree_audio_gateway")))
         role = "phone";
     else {
-        pa_log_debug("Profile %s cannot be selected for loopback", s);
+        pa_log_notice("Profile %s cannot be selected for loopback", s);
         return PA_HOOK_OK;
     }
 
@@ -133,7 +133,7 @@ static pa_hook_result_t sink_put_hook_callback(pa_core *c, pa_sink *sink, void *
          pa_streq(s, "handsfree_audio_gateway")))
         role = "phone";
     else {
-        pa_log_debug("Profile %s cannot be selected for loopback", s);
+        pa_log_notice("Profile %s cannot be selected for loopback", s);
         return PA_HOOK_OK;
     }
 
@@ -166,7 +166,7 @@ static void card_set_profile(struct userdata *u, pa_card *card, bool revert_to_a
                 continue;
         }
 
-        pa_log_debug("Setting card '%s' to profile '%s'", card->name, profile->name);
+        pa_log_notice("Setting card '%s' to profile '%s'", card->name, profile->name);
 
         if (pa_card_set_profile(card, profile, false) != 0) {
             pa_log_warn("Could not set profile '%s'", profile->name);
@@ -391,7 +391,7 @@ static pa_hook_result_t profile_available_hook_callback(pa_core *c, pa_card_prof
             return PA_HOOK_OK;
     }
 
-    pa_log_debug("Setting card '%s' to profile '%s'", card->name, selected_profile->name);
+    pa_log_notice("Setting card '%s' to profile '%s'", card->name, selected_profile->name);
 
     if (pa_card_set_profile(card, selected_profile, false) != 0)
         pa_log_warn("Could not set profile '%s'", selected_profile->name);

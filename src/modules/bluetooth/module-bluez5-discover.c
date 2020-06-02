@@ -64,7 +64,7 @@ static pa_hook_result_t device_connection_changed_cb(pa_bluetooth_discovery *y, 
 
     if (module_loaded && !pa_bluetooth_device_any_transport_connected(d)) {
         /* disconnection, the module unloads itself */
-        pa_log_debug("Unregistering module for %s", d->path);
+        pa_log_notice("Unregistering module for %s", d->path);
         pa_hashmap_remove(u->loaded_device_paths, d->path);
         return PA_HOOK_OK;
     }
@@ -74,7 +74,7 @@ static pa_hook_result_t device_connection_changed_cb(pa_bluetooth_discovery *y, 
         pa_module *m;
         char *args = pa_sprintf_malloc("path=%s autodetect_mtu=%i", d->path, (int)u->autodetect_mtu);
 
-        pa_log_debug("Loading module-bluez5-device %s", args);
+        pa_log_notice("Loading module-bluez5-device %s", args);
         pa_module_load(&m, u->module->core, "module-bluez5-device", args);
         pa_xfree(args);
 

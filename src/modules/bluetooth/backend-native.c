@@ -150,7 +150,7 @@ static void rfcomm_write(int fd, const char *str)
     size_t len;
     char buf[512];
 
-    pa_log_debug("RFCOMM >> %s", str);
+    pa_log_notice("RFCOMM >> %s", str);
     sprintf(buf, "\r\n%s\r\n", str);
     len = write(fd, buf, strlen(buf));
 
@@ -205,7 +205,7 @@ static int sco_do_connect(pa_bluetooth_transport *t) {
     addr.sco_family = AF_BLUETOOTH;
     bacpy(&addr.sco_bdaddr, &dst);
 
-    pa_log_info("doing connect");
+    pa_log_notice("doing connect");
     err = connect(sock, (struct sockaddr *) &addr, len);
     if (err < 0 && !(errno == EAGAIN || errno == EINPROGRESS)) {
         pa_log_error("connect(): %s", pa_cstrerror(errno));
@@ -227,7 +227,7 @@ static int sco_do_accept(pa_bluetooth_transport *t) {
     memset(&addr, 0, sizeof(addr));
     optlen = sizeof(addr);
 
-    pa_log_info ("doing accept");
+    pa_log_notice ("doing accept");
     sock = accept(trd->sco_fd, (struct sockaddr *) &addr, &optlen);
     if (sock < 0) {
         if (errno != EAGAIN)
@@ -264,7 +264,7 @@ static int sco_acquire_cb(pa_bluetooth_transport *t, bool optional, size_t *imtu
         if (getsockopt(sock, SOL_SCO, SCO_OPTIONS, &sco_opt, &len) < 0)
             pa_log_warn("getsockopt(SCO_OPTIONS) failed, loading defaults");
         else {
-            pa_log_debug("autodetected imtu = omtu = %u", sco_opt.mtu);
+            pa_log_notice("autodetected imtu = omtu = %u", sco_opt.mtu);
             if (imtu) *imtu = sco_opt.mtu;
             if (omtu) *omtu = sco_opt.mtu;
         }
@@ -277,7 +277,7 @@ fail:
 }
 
 static void sco_release_cb(pa_bluetooth_transport *t) {
-    pa_log_info("Transport %s released", t->path);
+    pa_log_notice("Transport %s released", t->path);
     /* device will close the SCO socket for us */
 }
 
@@ -293,7 +293,7 @@ static void sco_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_io_e
     }
 
     if (t->state != PA_BLUETOOTH_TRANSPORT_STATE_PLAYING) {
-        pa_log_info("SCO incoming connection: changing state to PLAYING");
+        pa_log_notice("SCO incoming connection: changing state to PLAYING");
         pa_bluetooth_transport_set_state (t, PA_BLUETOOTH_TRANSPORT_STATE_PLAYING);
     }
 
@@ -330,7 +330,7 @@ static int sco_listen(pa_bluetooth_transport *t) {
         goto fail_close;
     }
 
-    pa_log_info ("doing listen");
+    pa_log_notice ("doing listen");
     if (listen(sock, 1) < 0) {
         pa_log_error("listen(): %s", pa_cstrerror(errno));
         goto fail_close;
@@ -360,7 +360,7 @@ static void register_profile_reply(DBusPendingCall *pending, void *userdata) {
     pa_assert_se(r = dbus_pending_call_steal_reply(pending));
 
     if (dbus_message_is_error(r, BLUEZ_ERROR_NOT_SUPPORTED)) {
-        pa_log_info("Couldn't register profile %s because it is disabled in BlueZ", profile);
+        pa_log_notice("Couldn't register profile %s because it is disabled in BlueZ", profile);
         goto finish;
     }
 
@@ -385,7 +385,7 @@ static void register_profile(pa_bluetooth_backend *b, const char *profile, const
     dbus_bool_t autoconnect;
     dbus_uint16_t version, chan;
 
-    pa_log_debug("Registering Profile %s %s", profile, uuid);
+    pa_log_notice("Registering Profile %s %s", profile, uuid);
 
     pa_assert_se(m = dbus_message_new_method_call(BLUEZ_SERVICE, "/org/bluez", BLUEZ_PROFILE_MANAGER_INTERFACE, "RegisterProfile"));
 
@@ -417,7 +417,7 @@ static void transport_put(pa_bluetooth_transport *t)
 {
     pa_bluetooth_transport_put(t);
 
-    pa_log_debug("Transport %s available for profile %s", t->path, pa_bluetooth_profile_to_string(t->profile));
+    pa_log_notice("Transport %s available for profile %s", t->path, pa_bluetooth_profile_to_string(t->profile));
 }
 
 static bool hfp_rfcomm_handle(int fd, pa_bluetooth_transport *t, const char *buf)
@@ -428,7 +428,7 @@ static bool hfp_rfcomm_handle(int fd, pa_bluetooth_transport *t, const char *buf
     /* stateful negotiation */
     if (c->state == 0 && sscanf(buf, "AT+BRSF=%d", &val) == 1) {
           c->capabilities = val;
-          pa_log_info("HFP capabilities returns 0x%x", val);
+          pa_log_notice("HFP capabilities returns 0x%x", val);
           if (val & HFP_HF_RVOL) {
               c->speaker_gain_supported = true;
               c->mic_gain_supported = false;
@@ -479,7 +479,7 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
     pa_assert(t);
 
     if (events & (PA_IO_EVENT_HANGUP|PA_IO_EVENT_ERROR)) {
-        pa_log_info("Lost RFCOMM connection.");
+        pa_log_notice("Lost RFCOMM connection.");
         goto fail;
     }
 
@@ -496,7 +496,7 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
             goto fail;
         }
         buf[len] = 0;
-        pa_log_debug("RFCOMM << %s", buf);
+        pa_log_notice("RFCOMM << %s", buf);
 
         /* There are only four HSP AT commands:
          * AT+VGS=value: value between 0 and 15, sent by the HS to AG to set the speaker gain.
@@ -531,7 +531,7 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
         }
 
         if (do_reply) {
-            pa_log_debug("RFCOMM >> OK");
+            pa_log_notice("RFCOMM >> OK");
 
             len = write(fd, "\r\nOK\r\n", 6);
 
@@ -580,13 +580,13 @@ static void set_speaker_gain(pa_bluetooth_transport *t, uint16_t gain) {
      * in this case we notify the AG that the microphone gain has changed */
     if (t->profile == PA_BLUETOOTH_PROFILE_HSP_HS) {
         len = sprintf(buf, "\r\n+VGS=%d\r\n", gain);
-        pa_log_debug("RFCOMM >> +VGS=%d", gain);
+        pa_log_notice("RFCOMM >> +VGS=%d", gain);
     } else if (t->profile == PA_BLUETOOTH_PROFILE_HFP_HF) {
         len = sprintf(buf, "\r\n+VGS:%d\r\n", gain);
-        pa_log_debug("RFCOMM >> +VGS:%d", gain);
+        pa_log_notice("RFCOMM >> +VGS:%d", gain);
     } else {
         len = sprintf(buf, "\r\nAT+VGM=%d\r\n", gain);
-        pa_log_debug("RFCOMM >> AT+VGM=%d", gain);
+        pa_log_notice("RFCOMM >> AT+VGM=%d", gain);
     }
 
     written = write(trd->rfcomm_fd, buf, len);
@@ -610,13 +610,13 @@ static void set_microphone_gain(pa_bluetooth_transport *t, uint16_t gain) {
      * in this case we notify the AG that the speaker gain has changed */
     if (t->profile == PA_BLUETOOTH_PROFILE_HSP_HS) {
         len = sprintf(buf, "\r\n+VGM=%d\r\n", gain);
-        pa_log_debug("RFCOMM >> +VGM=%d", gain);
+        pa_log_notice("RFCOMM >> +VGM=%d", gain);
     } else if (t->profile == PA_BLUETOOTH_PROFILE_HFP_HF) {
         len = sprintf(buf, "\r\n+VGM:%d\r\n", gain);
-        pa_log_debug("RFCOMM >> +VGM:%d", gain);
+        pa_log_notice("RFCOMM >> +VGM:%d", gain);
     } else {
         len = sprintf(buf, "\r\nAT+VGS=%d\r\n", gain);
-        pa_log_debug("RFCOMM >> AT+VGS=%d", gain);
+        pa_log_notice("RFCOMM >> AT+VGS=%d", gain);
     }
 
     written = write (trd->rfcomm_fd, buf, len);
@@ -668,7 +668,7 @@ static DBusMessage *profile_new_connection(DBusConnection *conn, DBusMessage *m,
     pa_assert(dbus_message_iter_get_arg_type(&arg_i) == DBUS_TYPE_UNIX_FD);
     dbus_message_iter_get_basic(&arg_i, &fd);
 
-    pa_log_debug("dbus: NewConnection path=%s, fd=%d, profile %s", path, fd,
+    pa_log_notice("dbus: NewConnection path=%s, fd=%d, profile %s", path, fd,
         pa_bluetooth_profile_to_string(p));
 
     sender = dbus_message_get_sender(m);
@@ -725,7 +725,7 @@ static DBusHandlerResult profile_handler(DBusConnection *c, DBusMessage *m, void
     interface = dbus_message_get_interface(m);
     member = dbus_message_get_member(m);
 
-    pa_log_debug("dbus: path=%s, interface=%s, member=%s", path, interface, member);
+    pa_log_notice("dbus: path=%s, interface=%s, member=%s", path, interface, member);
 
     if (!pa_streq(path, HSP_AG_PROFILE) && !pa_streq(path, HSP_HS_PROFILE)
         && !pa_streq(path, HFP_AG_PROFILE))
@@ -738,7 +738,7 @@ static DBusHandlerResult profile_handler(DBusConnection *c, DBusMessage *m, void
         pa_assert_se(dbus_message_append_args(r, DBUS_TYPE_STRING, &xml, DBUS_TYPE_INVALID));
 
     } else if (dbus_message_is_method_call(m, BLUEZ_PROFILE_INTERFACE, "Release")) {
-        pa_log_debug("Release not handled");
+        pa_log_notice("Release not handled");
         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
     } else if (dbus_message_is_method_call(m, BLUEZ_PROFILE_INTERFACE, "RequestDisconnection")) {
         r = profile_request_disconnection(c, m, userdata);
@@ -822,7 +822,7 @@ pa_bluetooth_backend *pa_bluetooth_native_backend_new(pa_core *c, pa_bluetooth_d
     pa_bluetooth_backend *backend;
     DBusError err;
 
-    pa_log_debug("Bluetooth Headset Backend API support using the native backend");
+    pa_log_notice("Bluetooth Headset Backend API support using the native backend");
 
     backend = pa_xnew0(pa_bluetooth_backend, 1);
     backend->core = c;

@@ -265,7 +265,7 @@ static void wait_for_profiles_cb(pa_mainloop_api *api, pa_time_event* event, con
     }
 
     profiles_str = pa_strbuf_to_string_free(buf);
-    pa_log_debug("Timeout expired, and device %s still has disconnected profiles: %s",
+    pa_log_notice("Timeout expired, and device %s still has disconnected profiles: %s",
                  device->path, profiles_str);
     pa_xfree(profiles_str);
     pa_hook_fire(&device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], device);
@@ -291,7 +291,7 @@ void pa_bluetooth_transport_set_state(pa_bluetooth_transport *t, pa_bluetooth_tr
 
     old_any_connected = pa_bluetooth_device_any_transport_connected(t->device);
 
-    pa_log_debug("Transport %s state: %s -> %s",
+    pa_log_notice("Transport %s state: %s -> %s",
                  t->path, transport_state_to_string(t->state), transport_state_to_string(state));
 
     t->state = state;
@@ -388,7 +388,7 @@ static int bluez5_transport_acquire_cb(pa_bluetooth_transport *t, bool optional,
     m = NULL;
     if (!r) {
         if (optional && pa_streq(err.name, "org.bluez.Error.NotAvailable"))
-            pa_log_info("Failed optional acquire of unavailable transport %s", t->path);
+            pa_log_notice("Failed optional acquire of unavailable transport %s", t->path);
         else
             pa_log_error("Transport %s() failed for transport %s (%s)", method, t->path, err.message);
 
@@ -426,7 +426,7 @@ static void bluez5_transport_release_cb(pa_bluetooth_transport *t) {
     dbus_error_init(&err);
 
     if (t->state <= PA_BLUETOOTH_TRANSPORT_STATE_IDLE) {
-        pa_log_info("Transport %s auto-released by BlueZ or already released", t->path);
+        pa_log_notice("Transport %s auto-released by BlueZ or already released", t->path);
         return;
     }
 
@@ -443,7 +443,7 @@ static void bluez5_transport_release_cb(pa_bluetooth_transport *t) {
         pa_log_error("Failed to release transport %s: %s", t->path, err.message);
         dbus_error_free(&err);
     } else
-        pa_log_info("Transport %s released", t->path);
+        pa_log_notice("Transport %s released", t->path);
 }
 
 bool pa_bluetooth_device_any_transport_connected(const pa_bluetooth_device *d) {
@@ -615,7 +615,7 @@ static void device_remove(pa_bluetooth_discovery *y, const char *path) {
     if (!(d = pa_hashmap_remove(y->devices, path)))
         pa_log_warn("Unknown device removed %s", path);
     else {
-        pa_log_debug("Device %s removed", path);
+        pa_log_notice("Device %s removed", path);
         device_free(d);
     }
 }
@@ -705,7 +705,7 @@ static void adapter_remove(pa_bluetooth_discovery *y, const char *path) {
     if (!(a = pa_hashmap_remove(y->adapters, path)))
         pa_log_warn("Unknown adapter removed %s", path);
     else {
-        pa_log_debug("Adapter %s removed", path);
+        pa_log_notice("Adapter %s removed", path);
         adapter_free(a);
     }
 }
@@ -733,7 +733,7 @@ static void parse_device_property(pa_bluetooth_device *d, DBusMessageIter *i) {
             if (pa_streq(key, "Alias")) {
                 pa_xfree(d->alias);
                 d->alias = pa_xstrdup(value);
-                pa_log_debug("%s: %s", key, value);
+                pa_log_notice("%s: %s", key, value);
             } else if (pa_streq(key, "Address")) {
                 if (d->properties_received) {
                     pa_log_warn("Device property 'Address' expected to be constant but changed for %s, ignoring", d->path);
@@ -746,7 +746,7 @@ static void parse_device_property(pa_bluetooth_device *d, DBusMessageIter *i) {
                 }
 
                 d->address = pa_xstrdup(value);
-                pa_log_debug("%s: %s", key, value);
+                pa_log_notice("%s: %s", key, value);
             }
 
             break;
@@ -769,7 +769,7 @@ static void parse_device_property(pa_bluetooth_device *d, DBusMessageIter *i) {
                 }
 
                 d->adapter_path = pa_xstrdup(value);
-                pa_log_debug("%s: %s", key, value);
+                pa_log_notice("%s: %s", key, value);
             }
 
             break;
@@ -781,7 +781,7 @@ static void parse_device_property(pa_bluetooth_device *d, DBusMessageIter *i) {
 
             if (pa_streq(key, "Class")) {
                 d->class_of_device = value;
-                pa_log_debug("%s: %d", key, value);
+                pa_log_notice("%s: %d", key, value);
             }
 
             break;
@@ -808,7 +808,7 @@ static void parse_device_property(pa_bluetooth_device *d, DBusMessageIter *i) {
                     uuid = pa_xstrdup(value);
                     pa_hashmap_put(d->uuids, uuid, uuid);
 
-                    pa_log_debug("%s: %s", key, value);
+                    pa_log_notice("%s: %s", key, value);
                     dbus_message_iter_next(&ai);
                 }
             }
@@ -896,7 +896,7 @@ static void register_endpoint_reply(DBusPendingCall *pending, void *userdata) {
     pa_assert_se(r = dbus_pending_call_steal_reply(pending));
 
     if (dbus_message_is_error(r, BLUEZ_ERROR_NOT_SUPPORTED)) {
-        pa_log_info("Couldn't register endpoint %s because it is disabled in BlueZ", endpoint);
+        pa_log_notice("Couldn't register endpoint %s because it is disabled in BlueZ", endpoint);
         goto finish;
     }
 
@@ -922,7 +922,7 @@ static void register_endpoint(pa_bluetooth_discovery *y, const pa_a2dp_codec *a2
     size_t capabilities_size;
     uint8_t codec_id;
 
-    pa_log_debug("Registering %s on adapter %s", endpoint, path);
+    pa_log_notice("Registering %s on adapter %s", endpoint, path);
 
     codec_id = a2dp_codec->id.codec_id;
     capabilities_size = a2dp_codec->fill_capabilities(capabilities);
@@ -979,7 +979,7 @@ static void parse_interfaces_and_properties(pa_bluetooth_discovery *y, DBusMessa
             } else
                 a = adapter_create(y, path);
 
-            pa_log_debug("Adapter %s found", path);
+            pa_log_notice("Adapter %s found", path);
 
             parse_adapter_properties(a, &iface_i, false);
 
@@ -1011,12 +1011,12 @@ static void parse_interfaces_and_properties(pa_bluetooth_discovery *y, DBusMessa
             } else
                 d = device_create(y, path);
 
-            pa_log_debug("Device %s found", d->path);
+            pa_log_notice("Device %s found", d->path);
 
             parse_device_properties(d, &iface_i);
 
         } else
-            pa_log_debug("Unknown interface %s found, skipping", interface);
+            pa_log_notice("Unknown interface %s found, skipping", interface);
 
         dbus_message_iter_next(&element_i);
     }
@@ -1042,7 +1042,7 @@ static void parse_interfaces_and_properties(pa_bluetooth_discovery *y, DBusMessa
 void pa_bluetooth_discovery_set_ofono_running(pa_bluetooth_discovery *y, bool is_running) {
     pa_assert(y);
 
-    pa_log_debug("oFono is running: %s", pa_yes_no(is_running));
+    pa_log_notice("oFono is running: %s", pa_yes_no(is_running));
     if (y->headset_backend != HEADSET_BACKEND_AUTO)
         return;
 
@@ -1158,7 +1158,7 @@ static DBusHandlerResult filter_cb(DBusConnection *bus, DBusMessage *m, void *us
 
         if (pa_streq(name, BLUEZ_SERVICE)) {
             if (old_owner && *old_owner) {
-                pa_log_debug("Bluetooth daemon disappeared");
+                pa_log_notice("Bluetooth daemon disappeared");
                 pa_hashmap_remove_all(y->devices);
                 pa_hashmap_remove_all(y->adapters);
                 y->objects_listed = false;
@@ -1173,7 +1173,7 @@ static DBusHandlerResult filter_cb(DBusConnection *bus, DBusMessage *m, void *us
             }
 
             if (new_owner && *new_owner) {
-                pa_log_debug("Bluetooth daemon appeared");
+                pa_log_notice("Bluetooth daemon appeared");
                 get_managed_objects(y);
             }
         }
@@ -1248,7 +1248,7 @@ static DBusHandlerResult filter_cb(DBusConnection *bus, DBusMessage *m, void *us
         if (pa_streq(iface, BLUEZ_ADAPTER_INTERFACE)) {
             pa_bluetooth_adapter *a;
 
-            pa_log_debug("Properties changed in adapter %s", dbus_message_get_path(m));
+            pa_log_notice("Properties changed in adapter %s", dbus_message_get_path(m));
 
             if (!(a = pa_hashmap_get(y->adapters, dbus_message_get_path(m)))) {
                 pa_log_warn("Properties changed in unknown adapter");
@@ -1260,7 +1260,7 @@ static DBusHandlerResult filter_cb(DBusConnection *bus, DBusMessage *m, void *us
         } else if (pa_streq(iface, BLUEZ_DEVICE_INTERFACE)) {
             pa_bluetooth_device *d;
 
-            pa_log_debug("Properties changed in device %s", dbus_message_get_path(m));
+            pa_log_notice("Properties changed in device %s", dbus_message_get_path(m));
 
             if (!(d = pa_hashmap_get(y->devices, dbus_message_get_path(m)))) {
                 pa_log_warn("Properties changed in unknown device");
@@ -1274,7 +1274,7 @@ static DBusHandlerResult filter_cb(DBusConnection *bus, DBusMessage *m, void *us
         } else if (pa_streq(iface, BLUEZ_MEDIA_TRANSPORT_INTERFACE)) {
             pa_bluetooth_transport *t;
 
-            pa_log_debug("Properties changed in transport %s", dbus_message_get_path(m));
+            pa_log_notice("Properties changed in transport %s", dbus_message_get_path(m));
 
             if (!(t = pa_hashmap_get(y->transports, dbus_message_get_path(m))))
                 return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -1454,7 +1454,7 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
     t->release = bluez5_transport_release_cb;
     pa_bluetooth_transport_put(t);
 
-    pa_log_debug("Transport %s available for profile %s", t->path, pa_bluetooth_profile_to_string(t->profile));
+    pa_log_notice("Transport %s available for profile %s", t->path, pa_bluetooth_profile_to_string(t->profile));
 
     return NULL;
 
@@ -1521,7 +1521,7 @@ static DBusMessage *endpoint_clear_configuration(DBusConnection *conn, DBusMessa
     }
 
     if ((t = pa_hashmap_get(y->transports, path))) {
-        pa_log_debug("Clearing transport %s profile %s", t->path, pa_bluetooth_profile_to_string(t->profile));
+        pa_log_notice("Clearing transport %s profile %s", t->path, pa_bluetooth_profile_to_string(t->profile));
         pa_bluetooth_transport_free(t);
     }
 
@@ -1569,7 +1569,7 @@ static DBusHandlerResult endpoint_handler(DBusConnection *c, DBusMessage *m, voi
     interface = dbus_message_get_interface(m);
     member = dbus_message_get_member(m);
 
-    pa_log_debug("dbus: path=%s, interface=%s, member=%s", path, interface, member);
+    pa_log_notice("dbus: path=%s, interface=%s, member=%s", path, interface, member);
 
     if (!a2dp_endpoint_to_a2dp_codec(path))
         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;

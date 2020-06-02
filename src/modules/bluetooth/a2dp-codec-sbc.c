@@ -435,7 +435,7 @@ static void *init(bool for_encoding, bool for_backchannel, const uint8_t *config
 
     set_params(sbc_info);
 
-    pa_log_info("SBC parameters: allocation=%s, subbands=%u, blocks=%u, mode=%s bitpool=%u codesize=%u frame_length=%u",
+    pa_log_notice("SBC parameters: allocation=%s, subbands=%u, blocks=%u, mode=%s bitpool=%u codesize=%u frame_length=%u",
                 sbc_info->sbc.allocation ? "SNR" : "Loudness", sbc_info->sbc.subbands ? 8 : 4,
                 (sbc_info->sbc.blocks+1)*4, sbc_info->sbc.mode == SBC_MODE_MONO ? "Mono" :
                 sbc_info->sbc.mode == SBC_MODE_DUAL_CHANNEL ? "DualChannel" :
@@ -463,7 +463,7 @@ static void set_bitpool(struct sbc_info *sbc_info, uint8_t bitpool) {
     sbc_info->codesize = sbc_get_codesize(&sbc_info->sbc);
     sbc_info->frame_length = sbc_get_frame_length(&sbc_info->sbc);
 
-    pa_log_debug("Bitpool has changed to %u", sbc_info->sbc.bitpool);
+    pa_log_notice("Bitpool has changed to %u", sbc_info->sbc.bitpool);
 }
 
 static int reset(void *codec_info) {
@@ -571,7 +571,7 @@ static size_t encode_buffer(void *codec_info, uint32_t timestamp, const uint8_t 
     }
 
     PA_ONCE_BEGIN {
-        pa_log_debug("Using SBC codec implementation: %s", pa_strnull(sbc_get_implementation_info(&sbc_info->sbc)));
+        pa_log_notice("Using SBC codec implementation: %s", pa_strnull(sbc_get_implementation_info(&sbc_info->sbc)));
     } PA_ONCE_END;
 
     if (PA_UNLIKELY(frame_count == 0)) {
