@@ -47,12 +47,14 @@ PA_MODULE_USAGE(
         "only_from_unavailable=<boolean, only switch from unavailable ports> "
         "ignore_virtual=<boolean, ignore new virtual sinks and sources, defaults to true> "
         "blacklist=<regex, ignore matching devices> "
+        "ignore_not_bt_when_default_is_bt=<boolean, ignore when default is bluetooth, defaults to true> "
 );
 
 static const char* const valid_modargs[] = {
     "only_from_unavailable",
     "ignore_virtual",
     "blacklist",
+    "ignore_not_bt_when_default_is_bt",
     NULL,
 };
 
@@ -60,6 +62,7 @@ struct userdata {
     bool only_from_unavailable;
     bool ignore_virtual;
     char *blacklist;
+    bool ignore_not_bt_when_default_is_bt;
 };
 
 static pa_hook_result_t sink_put_hook_callback(pa_core *c, pa_sink *sink, void* userdata) {
@@ -74,48 +77,57 @@ static pa_hook_result_t sink_put_hook_callback(pa_core *c, pa_sink *sink, void* 
     if (c->state != PA_CORE_RUNNING)
         return PA_HOOK_OK;
 
-    pa_log_debug("Trying to switch to new sink %s", sink->name);
+    pa_log_notice("Trying to switch to new sink %s", sink->name);
 
     /* Don't switch to any internal devices except HDMI */
     s = pa_proplist_gets(sink->proplist, PA_PROP_DEVICE_STRING);
     if (s && !pa_startswith(s, "hdmi")) {
         s = pa_proplist_gets(sink->proplist, PA_PROP_DEVICE_BUS);
         if (pa_safe_streq(s, "pci") || pa_safe_streq(s, "isa")) {
-            pa_log_debug("Refusing to switch to sink on %s bus", s);
+            pa_log_notice("Refusing to switch to sink on %s bus", s);
             return PA_HOOK_OK;
         }
     }
 
     /* Ignore sinks matching the blacklist regex */
     if (u->blacklist && (pa_match(u->blacklist, sink->name) > 0)) {
-        pa_log_info("Refusing to switch to blacklisted sink %s", sink->name);
+        pa_log_notice("Refusing to switch to blacklisted sink %s", sink->name);
         return PA_HOOK_OK;
     }
 
     /* Ignore virtual sinks if not configured otherwise on the command line */
     if (u->ignore_virtual && !(sink->flags & PA_SINK_HARDWARE)) {
-        pa_log_debug("Refusing to switch to virtual sink");
+        pa_log_notice("Refusing to switch to virtual sink");
         return PA_HOOK_OK;
     }
 
     /* No default sink, nothing to move away, just set the new default */
     if (!c->default_sink) {
+        pa_log_notice("%s set as default sink", sink->name);
         pa_core_set_configured_default_sink(c, sink->name);
         return PA_HOOK_OK;
     }
 
     if (c->default_sink == sink) {
-        pa_log_debug("%s already is the default sink", sink->name);
+        pa_log_notice("%s already is the default sink", sink->name);
         return PA_HOOK_OK;
     }
 
+    if (u->ignore_not_bt_when_default_is_bt)
+        if (pa_startswith(c->default_sink->name, "bluez") && !pa_startswith(sink->name, "bluez")) {
+            pa_log_notice("Current default sink is %s and module argument ignore_not_bt_when_default_is_bt was set",
+                c->default_sink->name);
+            return PA_HOOK_OK;
+        }
+
     if (u->only_from_unavailable)
         if (!c->default_sink->active_port || c->default_sink->active_port->available != PA_AVAILABLE_NO) {
-            pa_log_debug("Current default sink is available and module argument only_from_unavailable was set");
+            pa_log_notice("Current default sink is available and module argument only_from_unavailable was set");
             return PA_HOOK_OK;
         }
 
     /* Actually do the switch to the new sink */
+    pa_log_notice("default sink: %s->%s", c->default_sink->name, sink->name);
     pa_core_set_configured_default_sink(c, sink->name);
 
     return PA_HOOK_OK;
@@ -137,45 +149,54 @@ static pa_hook_result_t source_put_hook_callback(pa_core *c, pa_source *source, 
     if (source->monitor_of)
         return PA_HOOK_OK;
 
-    pa_log_debug("Trying to switch to new source %s", source->name);
+    pa_log_notice("Trying to switch to new source %s", source->name);
 
     /* Don't switch to any internal devices */
     s = pa_proplist_gets(source->proplist, PA_PROP_DEVICE_BUS);
     if (pa_safe_streq(s, "pci") || pa_safe_streq(s, "isa")) {
-        pa_log_debug("Refusing to switch to source on %s bus", s);
+        pa_log_notice("Refusing to switch to source on %s bus", s);
         return PA_HOOK_OK;
     }
 
     /* Ignore sources matching the blacklist regex */
     if (u->blacklist && (pa_match(u->blacklist, source->name) > 0)) {
-        pa_log_info("Refusing to switch to blacklisted source %s", source->name);
+        pa_log_notice("Refusing to switch to blacklisted source %s", source->name);
         return PA_HOOK_OK;
     }
 
     /* Ignore virtual sources if not configured otherwise on the command line */
     if (u->ignore_virtual && !(source->flags & PA_SOURCE_HARDWARE)) {
-        pa_log_debug("Refusing to switch to virtual source");
+        pa_log_notice("Refusing to switch to virtual source");
         return PA_HOOK_OK;
     }
 
     /* No default source, nothing to move away, just set the new default */
     if (!c->default_source) {
+        pa_log_notice("%s set as default source", source->name);
         pa_core_set_configured_default_source(c, source->name);
         return PA_HOOK_OK;
     }
 
     if (c->default_source == source) {
-        pa_log_debug("%s already is the default source", source->name);
+        pa_log_notice("%s already is the default source", source->name);
         return PA_HOOK_OK;
     }
 
+    if (u->ignore_not_bt_when_default_is_bt)
+        if (pa_startswith(c->default_source->name, "bluez") && !pa_startswith(source->name, "bluez")) {
+            pa_log_notice("Current default source is %s and module argument ignore_not_bt_when_default_is_bt was set",
+                c->default_source->name);
+            return PA_HOOK_OK;
+        }
+
     if (u->only_from_unavailable)
         if (!c->default_source->active_port || c->default_source->active_port->available != PA_AVAILABLE_NO) {
-            pa_log_debug("Current default source is available and module argument only_from_unavailable was set");
+            pa_log_notice("Current default source is available and module argument only_from_unavailable was set");
             return PA_HOOK_OK;
         }
 
     /* Actually do the switch to the new source */
+    pa_log_notice("default source: %s->%s", c->default_source->name, source->name);
     pa_core_set_configured_default_source(c, source->name);
 
     return PA_HOOK_OK;
@@ -209,6 +230,12 @@ int pa__init(pa_module*m) {
     }
 
     u->blacklist = pa_xstrdup(pa_modargs_get_value(ma, "blacklist", DEFAULT_BLACKLIST));
+
+    u->ignore_not_bt_when_default_is_bt = true;
+    if (pa_modargs_get_value_boolean(ma, "ignore_not_bt_when_default_is_bt", &u->ignore_not_bt_when_default_is_bt) < 0) {
+        pa_log("Failed to get a boolean value for ignore_not_bt_when_default_is_bt.");
+        goto fail;
+    }
 
     /* An empty string disables all blacklisting. */
     if (!*u->blacklist) {
