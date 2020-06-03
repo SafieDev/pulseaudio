@@ -1191,7 +1191,7 @@ static void sink_set_volume_cb(pa_sink *s) {
 
     /* Set soft volume when in headset role or when in Audio Gateway mode and
        the headset/handsfree does not support remote volume control */
-    softonly = (u->profile == PA_BLUETOOTH_PROFILE_HFP_HF && !c->mic_gain_supported);
+    softonly = (u->profile == PA_BLUETOOTH_PROFILE_HFP_HF && !c->speaker_gain_supported);
     if (softonly ||
         u->profile == PA_BLUETOOTH_PROFILE_HSP_AG ||
         u->profile == PA_BLUETOOTH_PROFILE_HFP_AG)

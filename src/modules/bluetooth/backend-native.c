@@ -25,6 +25,8 @@
 #include <pulsecore/core-error.h>
 #include <pulsecore/core-util.h>
 #include <pulsecore/dbus-shared.h>
+#include <pulsecore/thread.h>
+#include <pulsecore/mutex.h>
 #include <pulsecore/log.h>
 
 #include <errno.h>
@@ -36,10 +38,15 @@
 
 #include "bluez5-util.h"
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
 struct pa_bluetooth_backend {
   pa_core *core;
   pa_dbus_connection *connection;
   pa_bluetooth_discovery *discovery;
+  pa_thread* safiesocket_thread;
   bool enable_hs_role;
 
   PA_LLIST_HEAD(pa_dbus_pending, pending);
@@ -126,6 +133,154 @@ static uint32_t hfp_features =
     "  </method>"                                                       \
     " </interface>"                                                     \
     "</node>"
+
+static void rfcomm_write(int fd, const char *str);
+
+static pa_mutex* safiesocket_mutex = NULL;
+static bool should_stop_safiesocket_receiver = false;
+static int safiesocket_fd = -1;
+static int safiesocket_open(void);
+static void safiesocket_close(void);
+static ssize_t safiesocket_send_rfcomm(int fd, const char* data);
+static ssize_t safiesocket_send(const char* data, size_t len);
+static ssize_t safiesocket_recv(char* data, size_t len);
+
+static int safiesocket_open(void)
+{
+    struct sockaddr_un addr;
+    pa_mutex_lock(safiesocket_mutex);
+
+    if (should_stop_safiesocket_receiver) {
+        pa_mutex_unlock(safiesocket_mutex);
+        return -1;
+    }
+
+    if (safiesocket_fd >= 0) {
+        pa_mutex_unlock(safiesocket_mutex);
+        return safiesocket_fd;
+    }
+
+    safiesocket_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if(safiesocket_fd < 0){
+        pa_log_error("socket error errno[%d]:%s", errno, strerror(errno));
+        pa_mutex_unlock(safiesocket_mutex);
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(struct sockaddr_un));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, "/tmp/pulseaudio.unixsocket");
+
+    if(connect(safiesocket_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) < 0){
+        pa_log_error("connect error errno[%d]:%s", errno, strerror(errno));
+        close(safiesocket_fd);
+        safiesocket_fd = -1;
+        pa_mutex_unlock(safiesocket_mutex);
+        return -1;
+    }
+
+    pa_log_notice("open safiesocket %d", safiesocket_fd);
+    pa_mutex_unlock(safiesocket_mutex);
+    return safiesocket_fd;
+}
+
+static void safiesocket_close(void)
+{
+    pa_mutex_lock(safiesocket_mutex);
+    if (safiesocket_fd >= 0) {
+        pa_log_notice("close safiesocket %d", safiesocket_fd);
+        close(safiesocket_fd);
+        safiesocket_fd = -1;
+    }
+    pa_mutex_unlock(safiesocket_mutex);
+}
+
+static ssize_t safiesocket_send_rfcomm(int fd, const char* data)
+{
+    static char buf[512];
+    const size_t len = sizeof(int) + strlen(data) + 1;
+
+    if (len > sizeof(buf)) {
+        return -1;
+    }
+
+    *((int*)buf) = fd;
+    memcpy(buf + sizeof(int), data, strlen(data));
+    buf[len - 1] = 0;
+
+    return safiesocket_send(buf, len);
+}
+
+static ssize_t safiesocket_send(const char* data, size_t len)
+{
+    ssize_t sent_size;
+    int socket_fd = safiesocket_open();
+    if (socket_fd < 0) {
+        return -1;
+    }
+
+    sent_size = send(socket_fd, data, len, 0);
+    if(sent_size < 0){
+        pa_log_error("send error, ret[%d], errno[%d]:%s", (int)sent_size, errno, strerror(errno));
+        safiesocket_close();
+        return -1;
+    }
+
+    if (sent_size != (int)len) {
+        pa_log_error("send error: sent_size=%d, len=%d", (int)sent_size, (int)len);
+    }
+
+    return sent_size;
+}
+
+static ssize_t safiesocket_recv(char* data, size_t len)
+{
+    ssize_t recv_size;
+    int socket_fd = safiesocket_open();
+    if (socket_fd < 0) {
+        return -1;
+    }
+    
+    recv_size = recv(socket_fd, data, len, 0);
+    if(recv_size <= 0){
+        pa_log_error("recv error, ret[%d], errno[%d]:%s", (int)recv_size, errno, strerror(errno));
+        safiesocket_close();
+        return -1;
+    }
+
+    return recv_size;
+}
+
+static void safiesocket_receiver(void *userdata) {
+    char buf[512];
+    int fd;
+    ssize_t recv_size;
+
+    while (true) {
+        recv_size = safiesocket_recv(buf, sizeof(buf));
+        if (should_stop_safiesocket_receiver) {
+            break;
+        }
+
+        if (recv_size <= 0) {
+            sleep(1);
+            continue;
+        }
+
+        if (recv_size <= (int)sizeof(fd)) {
+            safiesocket_close();
+            pa_log_error("recv error: recv_size=%d", (int)recv_size);
+            continue;
+        }
+
+        /* code */
+        fd = *((int*)buf);
+        rfcomm_write(fd, &buf[sizeof(fd)]);
+    }
+    
+    pa_log_notice("Safie thread shutting down");
+}
+
 
 static pa_dbus_pending* send_and_add_to_pending(pa_bluetooth_backend *backend, DBusMessage *m,
         DBusPendingCallNotifyFunction func, void *call_data) {
@@ -441,16 +596,19 @@ static bool hfp_rfcomm_handle(int fd, pa_bluetooth_transport *t, const char *buf
         rfcomm_write(fd, "+CIND: "
                      /* many indicators can be supported, only call and
                       * callheld are mandatory, so that's all we reply */
+                     "(\"service\",(0-1)),"
                      "(\"call\",(0-1)),"
-                     "(\"callheld\",(0-2))");
+                     "(\"callsetup\",(0-3)),"
+                     "(\"callheld\",(0-2))"
+                     );
         c->state = 2;
         return true;
     } else if (c->state == 2 && pa_startswith(buf, "AT+CIND?")) {
-        rfcomm_write(fd, "+CIND: 0,0");
+        rfcomm_write(fd, "+CIND: 1,0,0,0");
         c->state = 3;
         return true;
     } else if ((c->state == 2 || c->state == 3) && pa_startswith(buf, "AT+CMER=")) {
-        rfcomm_write(fd, "\r\nOK\r\n");
+        rfcomm_write(fd, "OK");
         c->state = 4;
         transport_put(t);
         return false;
@@ -460,7 +618,7 @@ static bool hfp_rfcomm_handle(int fd, pa_bluetooth_transport *t, const char *buf
     if (c->state != 4) {
         pa_log_error("HFP negotiation failed in state %d with inbound %s\n",
                      c->state, buf);
-        rfcomm_write(fd, "\r\nERROR\r\n");
+        rfcomm_write(fd, "ERROR");
         return false;
     }
 
@@ -487,7 +645,6 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
         char buf[512];
         ssize_t len;
         int gain, dummy;
-        bool  do_reply = false;
         struct hfp_config *c = t->config;
 
         len = pa_read(fd, buf, 511, NULL);
@@ -497,6 +654,16 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
         }
         buf[len] = 0;
         pa_log_notice("RFCOMM << %s", buf);
+
+        // rely to safiecam
+        safiesocket_send_rfcomm(fd, buf);
+
+        if (c->state < 4) {
+            if (hfp_rfcomm_handle(fd, t, buf)) {
+                rfcomm_write(fd, "OK");
+            }
+            return;
+        }
 
         /* There are only four HSP AT commands:
          * AT+VGS=value: value between 0 and 15, sent by the HS to AG to set the speaker gain.
@@ -513,32 +680,10 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
         if (sscanf(buf, "AT+VGS=%d", &gain) == 1 || sscanf(buf, "\r\n+VGM%*[=:]%d\r\n", &gain) == 1) {
             t->speaker_gain = gain;
             pa_hook_fire(pa_bluetooth_discovery_hook(t->device->discovery, PA_BLUETOOTH_HOOK_TRANSPORT_SPEAKER_GAIN_CHANGED), t);
-            do_reply = true;
         } else if (sscanf(buf, "AT+VGM=%d", &gain) == 1 || sscanf(buf, "\r\n+VGS%*[=:]%d\r\n", &gain) == 1) {
             c->mic_gain_supported = true;
             t->microphone_gain = gain;
             pa_hook_fire(pa_bluetooth_discovery_hook(t->device->discovery, PA_BLUETOOTH_HOOK_TRANSPORT_MICROPHONE_GAIN_CHANGED), t);
-            do_reply = true;
-        } else if (sscanf(buf, "AT+CKPD=%d", &dummy) == 1) {
-            do_reply = true;
-        } else if (pa_startswith(buf, "AT+NREC=0") == 1) {
-            /* TODO: Handle disabling echo cancelation if active */
-            do_reply = true;
-        } else if (t->config) { /* t->config is only non-null for hfp profile */
-            do_reply = hfp_rfcomm_handle(fd, t, buf);
-        } else {
-            do_reply = false;
-        }
-
-        if (do_reply) {
-            pa_log_notice("RFCOMM >> OK");
-
-            len = write(fd, "\r\nOK\r\n", 6);
-
-            /* we ignore any errors, it's not critical and real errors should
-             * be caught with the HANGUP and ERROR events handled above */
-            if (len < 0)
-                pa_log_error("RFCOMM write error: %s", pa_cstrerror(errno));
         }
     }
 
@@ -692,6 +837,18 @@ static DBusMessage *profile_new_connection(DBusConnection *conn, DBusMessage *m,
         rfcomm_io_callback, t);
     t->userdata =  trd;
 
+    if (p == PA_BLUETOOTH_PROFILE_HFP_HF) {
+        char buf[128];
+        int len = sprintf(buf, "NEW_HFP/%s", d->address);
+        buf[len] = 0;
+        safiesocket_send_rfcomm(fd, buf);
+    } else if (p == PA_BLUETOOTH_PROFILE_HSP_HS) {
+        char buf[128];
+        int len = sprintf(buf, "NEW_HSP/%s", d->address);
+        buf[len] = 0;
+        safiesocket_send_rfcomm(fd, buf);
+    }
+
     sco_listen(t);
 
     if (p != PA_BLUETOOTH_PROFILE_HFP_HF)
@@ -827,6 +984,13 @@ pa_bluetooth_backend *pa_bluetooth_native_backend_new(pa_core *c, pa_bluetooth_d
     backend = pa_xnew0(pa_bluetooth_backend, 1);
     backend->core = c;
 
+    safiesocket_mutex = pa_mutex_new(false, false);
+    if (!(backend->safiesocket_thread = pa_thread_new("safiesocket_receiver", safiesocket_receiver, backend))) {
+        pa_log_error("Failed to create safiesocket_receiver");
+        pa_xfree(backend);
+        return NULL;
+    }
+
     dbus_error_init(&err);
     if (!(backend->connection = pa_dbus_bus_get(c, DBUS_BUS_SYSTEM, &err))) {
         pa_log("Failed to get D-Bus connection: %s", err.message);
@@ -859,6 +1023,20 @@ void pa_bluetooth_native_backend_free(pa_bluetooth_backend *backend) {
       profile_done(backend, PA_BLUETOOTH_PROFILE_HFP_HF);
 
     pa_dbus_connection_unref(backend->connection);
+
+    if (backend->safiesocket_thread) {
+        pa_mutex_lock(safiesocket_mutex);
+        should_stop_safiesocket_receiver = true;
+        pa_mutex_unlock(safiesocket_mutex);
+        safiesocket_close();
+        pa_thread_join(backend->safiesocket_thread);
+        pa_thread_free(backend->safiesocket_thread);
+        backend->safiesocket_thread = NULL;
+    }
+
+    if (safiesocket_mutex != NULL) {
+        pa_mutex_free(safiesocket_mutex);
+    }
 
     pa_xfree(backend);
 }
