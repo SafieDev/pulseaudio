@@ -87,14 +87,18 @@ enum hfp_ag_features {
     HFP_AG_ECALL = 7,
     HFP_AG_EERR = 8,
     HFP_AG_CODECS = 9,
-    HFP_AG_INDICATORS = 9,
-    HFP_AG_ESCO_S4 = 10,
+    HFP_AG_INDICATORS = 10,
+    HFP_AG_ESCO_S4 = 11,
 };
 
 /* features we support, which is as little as we can get away with */
 static uint32_t hfp_features =
     /* HFP 1.6 requires this */
-    (1 << HFP_AG_ESTATUS);
+    (1 << HFP_AG_RING) |
+    (1 << HFP_AG_REJECT) |
+    (1 << HFP_AG_ESTATUS) |
+    (1 << HFP_AG_INDICATORS)
+    ;
 
 #define BLUEZ_SERVICE "org.bluez"
 #define BLUEZ_MEDIA_TRANSPORT_INTERFACE BLUEZ_SERVICE ".MediaTransport1"
@@ -582,15 +586,26 @@ static bool hfp_rfcomm_handle(int fd, pa_bluetooth_transport *t, const char *buf
 
     /* stateful negotiation */
     if (c->state == 0 && sscanf(buf, "AT+BRSF=%d", &val) == 1) {
-          c->capabilities = val;
-          pa_log_notice("HFP capabilities returns 0x%x", val);
-          if (val & HFP_HF_RVOL) {
-              c->speaker_gain_supported = true;
-              c->mic_gain_supported = false;
-          }
-          hfp_send_features(fd);
-          c->state = 1;
-          return true;
+        c->capabilities = val;
+        pa_log_notice("HFP capabilities returns 0x%x", val);
+        pa_log_notice("HFP_HF_EC_NR        = %d", ((val >> HFP_HF_EC_NR)&0x00000001));
+        pa_log_notice("HFP_HF_CALL_WAITING = %d", ((val >> HFP_HF_CALL_WAITING)&0x00000001));
+        pa_log_notice("HFP_HF_CLI          = %d", ((val >> HFP_HF_CLI)&0x00000001));
+        pa_log_notice("HFP_HF_VR           = %d", ((val >> HFP_HF_VR)&0x00000001));
+        pa_log_notice("HFP_HF_RVOL         = %d", ((val >> HFP_HF_RVOL)&0x00000001));
+        pa_log_notice("HFP_HF_ESTATUS      = %d", ((val >> HFP_HF_ESTATUS)&0x00000001));
+        pa_log_notice("HFP_HF_ECALL        = %d", ((val >> HFP_HF_ECALL)&0x00000001));
+        pa_log_notice("HFP_HF_CODECS       = %d", ((val >> HFP_HF_CODECS)&0x00000001));
+        pa_log_notice("HFP_HF_INDICATORS   = %d", ((val >> HFP_HF_INDICATORS)&0x00000001));
+        pa_log_notice("HFP_HF_ESCO_S4      = %d", ((val >> HFP_HF_ESCO_S4)&0x00000001));
+
+        if ((val >> HFP_HF_RVOL)&0x00000001) {
+            c->speaker_gain_supported = true;
+            c->mic_gain_supported = false;
+        }
+        hfp_send_features(fd);
+        c->state = 1;
+        return true;
     } else if (c->state == 1 && pa_startswith(buf, "AT+CIND=?")) {
         /* we declare minimal no indicators */
         rfcomm_write(fd, "+CIND: "
@@ -680,10 +695,12 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
         if (sscanf(buf, "AT+VGS=%d", &gain) == 1 || sscanf(buf, "\r\n+VGM%*[=:]%d\r\n", &gain) == 1) {
             t->speaker_gain = gain;
             pa_hook_fire(pa_bluetooth_discovery_hook(t->device->discovery, PA_BLUETOOTH_HOOK_TRANSPORT_SPEAKER_GAIN_CHANGED), t);
+            rfcomm_write(fd, "OK");
         } else if (sscanf(buf, "AT+VGM=%d", &gain) == 1 || sscanf(buf, "\r\n+VGS%*[=:]%d\r\n", &gain) == 1) {
             c->mic_gain_supported = true;
             t->microphone_gain = gain;
             pa_hook_fire(pa_bluetooth_discovery_hook(t->device->discovery, PA_BLUETOOTH_HOOK_TRANSPORT_MICROPHONE_GAIN_CHANGED), t);
+            rfcomm_write(fd, "OK");
         }
     }
 
