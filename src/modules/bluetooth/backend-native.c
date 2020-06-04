@@ -579,72 +579,7 @@ static void transport_put(pa_bluetooth_transport *t)
     pa_log_notice("Transport %s available for profile %s", t->path, pa_bluetooth_profile_to_string(t->profile));
 }
 
-static bool hfp_rfcomm_handle(int fd, pa_bluetooth_transport *t, const char *buf)
-{
-    struct hfp_config *c = t->config;
-    int val;
-
-    /* stateful negotiation */
-    if (c->state == 0 && sscanf(buf, "AT+BRSF=%d", &val) == 1) {
-        c->capabilities = val;
-        pa_log_notice("HFP capabilities returns 0x%x", val);
-        pa_log_notice("HFP_HF_EC_NR        = %d", ((val >> HFP_HF_EC_NR)&0x00000001));
-        pa_log_notice("HFP_HF_CALL_WAITING = %d", ((val >> HFP_HF_CALL_WAITING)&0x00000001));
-        pa_log_notice("HFP_HF_CLI          = %d", ((val >> HFP_HF_CLI)&0x00000001));
-        pa_log_notice("HFP_HF_VR           = %d", ((val >> HFP_HF_VR)&0x00000001));
-        pa_log_notice("HFP_HF_RVOL         = %d", ((val >> HFP_HF_RVOL)&0x00000001));
-        pa_log_notice("HFP_HF_ESTATUS      = %d", ((val >> HFP_HF_ESTATUS)&0x00000001));
-        pa_log_notice("HFP_HF_ECALL        = %d", ((val >> HFP_HF_ECALL)&0x00000001));
-        pa_log_notice("HFP_HF_CODECS       = %d", ((val >> HFP_HF_CODECS)&0x00000001));
-        pa_log_notice("HFP_HF_INDICATORS   = %d", ((val >> HFP_HF_INDICATORS)&0x00000001));
-        pa_log_notice("HFP_HF_ESCO_S4      = %d", ((val >> HFP_HF_ESCO_S4)&0x00000001));
-
-        if ((val >> HFP_HF_RVOL)&0x00000001) {
-            c->speaker_gain_supported = true;
-            c->mic_gain_supported = false;
-        }
-        hfp_send_features(fd);
-        c->state = 1;
-        return true;
-    } else if (c->state == 1 && pa_startswith(buf, "AT+CIND=?")) {
-        /* we declare minimal no indicators */
-        rfcomm_write(fd, "+CIND: "
-                     /* many indicators can be supported, only call and
-                      * callheld are mandatory, so that's all we reply */
-                     "(\"service\",(0-1)),"
-                     "(\"call\",(0-1)),"
-                     "(\"callsetup\",(0-3)),"
-                     "(\"callheld\",(0-2))"
-                     );
-        c->state = 2;
-        return true;
-    } else if (c->state == 2 && pa_startswith(buf, "AT+CIND?")) {
-        rfcomm_write(fd, "+CIND: 1,0,0,0");
-        c->state = 3;
-        return true;
-    } else if ((c->state == 2 || c->state == 3) && pa_startswith(buf, "AT+CMER=")) {
-        rfcomm_write(fd, "OK");
-        c->state = 4;
-        transport_put(t);
-        return false;
-    }
-
-    /* if we get here, negotiation should be complete */
-    if (c->state != 4) {
-        pa_log_error("HFP negotiation failed in state %d with inbound %s\n",
-                     c->state, buf);
-        rfcomm_write(fd, "ERROR");
-        return false;
-    }
-
-    /*
-     * once we're fully connected, just reply OK to everything
-     * it will just be the headset sending the occasional status
-     * update, but we process only the ones we care about
-     */
-    return true;
-}
-
+#define HANDLE_NEGOTIATION_IN_SAFIE
 static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_io_event_flags_t events, void *userdata) {
     pa_bluetooth_transport *t = userdata;
 
@@ -674,8 +609,55 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
         safiesocket_send_rfcomm(fd, buf);
 
         if (c->state < 4) {
-            if (hfp_rfcomm_handle(fd, t, buf)) {
+            int val;
+            /* stateful negotiation */
+            if (c->state == 0 && sscanf(buf, "AT+BRSF=%d", &val) == 1) {
+                c->capabilities = val;
+                pa_log_notice("HFP capabilities returns 0x%x", val);
+                pa_log_notice("HFP_HF_EC_NR        = %d", ((val >> HFP_HF_EC_NR)&0x00000001));
+                pa_log_notice("HFP_HF_CALL_WAITING = %d", ((val >> HFP_HF_CALL_WAITING)&0x00000001));
+                pa_log_notice("HFP_HF_CLI          = %d", ((val >> HFP_HF_CLI)&0x00000001));
+                pa_log_notice("HFP_HF_VR           = %d", ((val >> HFP_HF_VR)&0x00000001));
+                pa_log_notice("HFP_HF_RVOL         = %d", ((val >> HFP_HF_RVOL)&0x00000001));
+                pa_log_notice("HFP_HF_ESTATUS      = %d", ((val >> HFP_HF_ESTATUS)&0x00000001));
+                pa_log_notice("HFP_HF_ECALL        = %d", ((val >> HFP_HF_ECALL)&0x00000001));
+                pa_log_notice("HFP_HF_CODECS       = %d", ((val >> HFP_HF_CODECS)&0x00000001));
+                pa_log_notice("HFP_HF_INDICATORS   = %d", ((val >> HFP_HF_INDICATORS)&0x00000001));
+                pa_log_notice("HFP_HF_ESCO_S4      = %d", ((val >> HFP_HF_ESCO_S4)&0x00000001));
+
+                if ((val >> HFP_HF_RVOL)&0x00000001) {
+                    c->speaker_gain_supported = true;
+                    c->mic_gain_supported = false;
+                }
+#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
+                hfp_send_features(fd);
                 rfcomm_write(fd, "OK");
+#endif
+                c->state = 1;
+            } else if (c->state == 1 && pa_startswith(buf, "AT+CIND=?")) {
+                /* we declare minimal no indicators */
+#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
+                rfcomm_write(fd, "+CIND: "
+                            /* many indicators can be supported, only call and
+                            * callheld are mandatory, so that's all we reply */
+                            "(\"service\",(0-1)),"
+                            "(\"call\",(0-1)),"
+                            "(\"callsetup\",(0-3)),"
+                            "(\"callheld\",(0-2))"
+                            );
+                rfcomm_write(fd, "OK");
+#endif
+                c->state = 2;
+            } else if (c->state == 2 && pa_startswith(buf, "AT+CIND?")) {
+#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
+                rfcomm_write(fd, "+CIND: 1,0,0,0");
+                rfcomm_write(fd, "OK");
+#endif
+                c->state = 3;
+            } else if ((c->state == 2 || c->state == 3) && pa_startswith(buf, "AT+CMER=")) {
+                rfcomm_write(fd, "OK");
+                c->state = 4;
+                transport_put(t);
             }
             return;
         }
