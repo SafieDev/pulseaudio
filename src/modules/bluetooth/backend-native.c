@@ -335,8 +335,12 @@ static int sco_do_connect(pa_bluetooth_transport *t) {
     bdaddr_t dst;
     const char *src_addr, *dst_addr;
 
+    pa_log_notice ("sco_do_connect start");
+
     src_addr = d->adapter->address;
     dst_addr = d->address;
+
+    pa_log_notice ("doing connect(src_addr=%s, dst_addr=%s)", src_addr, dst_addr);
 
     /* don't use ba2str to avoid -lbluetooth */
     for (i = 5; i >= 0; i--, src_addr += 3)
@@ -446,6 +450,8 @@ static void sco_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_io_e
     pa_assert(io);
     pa_assert(t);
 
+    pa_log_notice("sco_io_callback,event=%d, t->state=%d", events, t->state);
+
     if (events & (PA_IO_EVENT_HANGUP|PA_IO_EVENT_ERROR)) {
         pa_log_error("error listening SCO connection: %s", pa_cstrerror(errno));
         goto fail;
@@ -489,7 +495,7 @@ static int sco_listen(pa_bluetooth_transport *t) {
         goto fail_close;
     }
 
-    pa_log_notice ("doing listen");
+    pa_log_notice ("doing listen(%s)", t->device->adapter->address);
     if (listen(sock, 1) < 0) {
         pa_log_error("listen(): %s", pa_cstrerror(errno));
         goto fail_close;
@@ -603,65 +609,61 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
             goto fail;
         }
         buf[len] = 0;
-        pa_log_notice("RFCOMM << %s", buf);
+        pa_log_notice("RFCOMM[st=%d] << %s", c->state, buf);
 
         // rely to safiecam
         safiesocket_send_rfcomm(fd, buf);
 
-        if (c->state < 4) {
-            int val;
-            /* stateful negotiation */
-            if (c->state == 0 && sscanf(buf, "AT+BRSF=%d", &val) == 1) {
-                c->capabilities = val;
-                pa_log_notice("HFP capabilities returns 0x%x", val);
-                pa_log_notice("HFP_HF_EC_NR        = %d", ((val >> HFP_HF_EC_NR)&0x00000001));
-                pa_log_notice("HFP_HF_CALL_WAITING = %d", ((val >> HFP_HF_CALL_WAITING)&0x00000001));
-                pa_log_notice("HFP_HF_CLI          = %d", ((val >> HFP_HF_CLI)&0x00000001));
-                pa_log_notice("HFP_HF_VR           = %d", ((val >> HFP_HF_VR)&0x00000001));
-                pa_log_notice("HFP_HF_RVOL         = %d", ((val >> HFP_HF_RVOL)&0x00000001));
-                pa_log_notice("HFP_HF_ESTATUS      = %d", ((val >> HFP_HF_ESTATUS)&0x00000001));
-                pa_log_notice("HFP_HF_ECALL        = %d", ((val >> HFP_HF_ECALL)&0x00000001));
-                pa_log_notice("HFP_HF_CODECS       = %d", ((val >> HFP_HF_CODECS)&0x00000001));
-                pa_log_notice("HFP_HF_INDICATORS   = %d", ((val >> HFP_HF_INDICATORS)&0x00000001));
-                pa_log_notice("HFP_HF_ESCO_S4      = %d", ((val >> HFP_HF_ESCO_S4)&0x00000001));
+        int val;
+        /* stateful negotiation */
+        if (pa_startswith(buf, "AT+BRSF=") && sscanf(buf, "AT+BRSF=%d", &val) == 1) {
+            c->capabilities = val;
+            pa_log_notice("HFP capabilities returns 0x%x", val);
+            pa_log_notice("HFP_HF_EC_NR        = %d", ((val >> HFP_HF_EC_NR)&0x00000001));
+            pa_log_notice("HFP_HF_CALL_WAITING = %d", ((val >> HFP_HF_CALL_WAITING)&0x00000001));
+            pa_log_notice("HFP_HF_CLI          = %d", ((val >> HFP_HF_CLI)&0x00000001));
+            pa_log_notice("HFP_HF_VR           = %d", ((val >> HFP_HF_VR)&0x00000001));
+            pa_log_notice("HFP_HF_RVOL         = %d", ((val >> HFP_HF_RVOL)&0x00000001));
+            pa_log_notice("HFP_HF_ESTATUS      = %d", ((val >> HFP_HF_ESTATUS)&0x00000001));
+            pa_log_notice("HFP_HF_ECALL        = %d", ((val >> HFP_HF_ECALL)&0x00000001));
+            pa_log_notice("HFP_HF_CODECS       = %d", ((val >> HFP_HF_CODECS)&0x00000001));
+            pa_log_notice("HFP_HF_INDICATORS   = %d", ((val >> HFP_HF_INDICATORS)&0x00000001));
+            pa_log_notice("HFP_HF_ESCO_S4      = %d", ((val >> HFP_HF_ESCO_S4)&0x00000001));
 
-                if ((val >> HFP_HF_RVOL)&0x00000001) {
-                    c->speaker_gain_supported = true;
-                    c->mic_gain_supported = false;
-                }
-#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
-                hfp_send_features(fd);
-                rfcomm_write(fd, "OK");
-#endif
-                c->state = 1;
-            } else if (c->state == 1 && pa_startswith(buf, "AT+CIND=?")) {
-                /* we declare minimal no indicators */
-#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
-                rfcomm_write(fd, "+CIND: "
-                            /* many indicators can be supported, only call and
-                            * callheld are mandatory, so that's all we reply */
-                            "(\"service\",(0-1)),"
-                            "(\"call\",(0-1)),"
-                            "(\"callsetup\",(0-3)),"
-                            "(\"callheld\",(0-2))"
-                            );
-                rfcomm_write(fd, "OK");
-#endif
-                c->state = 2;
-            } else if (c->state == 2 && pa_startswith(buf, "AT+CIND?")) {
-#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
-                rfcomm_write(fd, "+CIND: 1,0,0,0");
-                rfcomm_write(fd, "OK");
-#endif
-                c->state = 3;
-            } else if ((c->state == 2 || c->state == 3) && pa_startswith(buf, "AT+CMER=")) {
-                rfcomm_write(fd, "OK");
-                c->state = 4;
-                transport_put(t);
+            if ((val >> HFP_HF_RVOL)&0x00000001) {
+                c->speaker_gain_supported = true;
+                c->mic_gain_supported = false;
             }
-            return;
+#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
+            hfp_send_features(fd);
+            rfcomm_write(fd, "OK");
+#endif
+            c->state = 1;
+        } else if (pa_startswith(buf, "AT+CIND=?")) {
+            /* we declare minimal no indicators */
+#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
+            rfcomm_write(fd, "+CIND: "
+                        /* many indicators can be supported, only call and
+                        * callheld are mandatory, so that's all we reply */
+                        "(\"service\",(0-1)),"
+                        "(\"call\",(0-1)),"
+                        "(\"callsetup\",(0-3)),"
+                        "(\"callheld\",(0-2))"
+                        );
+            rfcomm_write(fd, "OK");
+#endif
+            c->state = 2;
+        } else if (pa_startswith(buf, "AT+CIND?")) {
+#if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
+            rfcomm_write(fd, "+CIND: 1,0,0,0");
+            rfcomm_write(fd, "OK");
+#endif
+            c->state = 3;
+        } else if (pa_startswith(buf, "AT+CMER=")) {
+            rfcomm_write(fd, "OK");
+            c->state = 4;
+            transport_put(t);
         }
-
         /* There are only four HSP AT commands:
          * AT+VGS=value: value between 0 and 15, sent by the HS to AG to set the speaker gain.
          * +VGS=value is sent by AG to HS as a response to an AT+VGS command or when the gain
@@ -674,9 +676,12 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
          * it does not expect a reply.
          *
          * Also in HFP we need to handle negotiation, including codec updating by the HG */
-        if (sscanf(buf, "AT+VGS=%d", &gain) == 1 || sscanf(buf, "\r\n+VGM%*[=:]%d\r\n", &gain) == 1) {
+        else if (sscanf(buf, "AT+VGS=%d", &gain) == 1 || sscanf(buf, "\r\n+VGM%*[=:]%d\r\n", &gain) == 1) {
+            pa_log_notice("before set gain");
             t->speaker_gain = gain;
+            pa_log_notice("before fire discovery");
             pa_hook_fire(pa_bluetooth_discovery_hook(t->device->discovery, PA_BLUETOOTH_HOOK_TRANSPORT_SPEAKER_GAIN_CHANGED), t);
+            pa_log_notice("after fire discovery");
             rfcomm_write(fd, "OK");
         } else if (sscanf(buf, "AT+VGM=%d", &gain) == 1 || sscanf(buf, "\r\n+VGS%*[=:]%d\r\n", &gain) == 1) {
             c->mic_gain_supported = true;
@@ -694,6 +699,8 @@ fail:
 }
 
 static void transport_destroy(pa_bluetooth_transport *t) {
+    pa_log_notice("transport_destroy");
+
     struct transport_data *trd = t->userdata;
 
     if (trd->sco_io) {
@@ -710,6 +717,8 @@ static void transport_destroy(pa_bluetooth_transport *t) {
 }
 
 static void set_speaker_gain(pa_bluetooth_transport *t, uint16_t gain) {
+    pa_log_notice("set_speaker_gain:%d", gain);
+
     struct transport_data *trd = t->userdata;
     char buf[512];
     ssize_t len, written;
@@ -740,6 +749,8 @@ static void set_speaker_gain(pa_bluetooth_transport *t, uint16_t gain) {
 }
 
 static void set_microphone_gain(pa_bluetooth_transport *t, uint16_t gain) {
+    pa_log_notice("set_microphone_gain:%d", gain);
+
     struct transport_data *trd = t->userdata;
     char buf[512];
     ssize_t len, written;
@@ -812,29 +823,33 @@ static DBusMessage *profile_new_connection(DBusConnection *conn, DBusMessage *m,
     pa_assert(dbus_message_iter_get_arg_type(&arg_i) == DBUS_TYPE_UNIX_FD);
     dbus_message_iter_get_basic(&arg_i, &fd);
 
-    pa_log_notice("dbus: NewConnection path=%s, fd=%d, profile %s", path, fd,
+    pa_log_notice("dbus: NewConnection[%s] path=%s, fd=%d, profile %s", 
+        d->address,
+        path, fd,
         pa_bluetooth_profile_to_string(p));
 
-    sender = dbus_message_get_sender(m);
+    if (p == PA_BLUETOOTH_PROFILE_HFP_HF) {
+        sender = dbus_message_get_sender(m);
 
-    pathfd = pa_sprintf_malloc ("%s/fd%d", path, fd);
-    t = pa_bluetooth_transport_new(d, sender, pathfd, p, NULL,
-                                   p == PA_BLUETOOTH_PROFILE_HFP_HF ?
-                                   sizeof(struct hfp_config) : 0);
-    pa_xfree(pathfd);
+        pathfd = pa_sprintf_malloc ("%s/fd%d", path, fd);
+        t = pa_bluetooth_transport_new(d, sender, pathfd, p, NULL,
+                                    p == PA_BLUETOOTH_PROFILE_HFP_HF ?
+                                    sizeof(struct hfp_config) : 0);
+        pa_xfree(pathfd);
 
-    t->acquire = sco_acquire_cb;
-    t->release = sco_release_cb;
-    t->destroy = transport_destroy;
-    t->set_speaker_gain = set_speaker_gain;
-    t->set_microphone_gain = set_microphone_gain;
+        t->acquire = sco_acquire_cb;
+        t->release = sco_release_cb;
+        t->destroy = transport_destroy;
+        t->set_speaker_gain = set_speaker_gain;
+        t->set_microphone_gain = set_microphone_gain;
 
-    trd = pa_xnew0(struct transport_data, 1);
-    trd->rfcomm_fd = fd;
-    trd->mainloop = b->core->mainloop;
-    trd->rfcomm_io = trd->mainloop->io_new(b->core->mainloop, fd, PA_IO_EVENT_INPUT,
-        rfcomm_io_callback, t);
-    t->userdata =  trd;
+        trd = pa_xnew0(struct transport_data, 1);
+        trd->rfcomm_fd = fd;
+        trd->mainloop = b->core->mainloop;
+        trd->rfcomm_io = trd->mainloop->io_new(b->core->mainloop, fd, PA_IO_EVENT_INPUT,
+            rfcomm_io_callback, t);
+        t->userdata =  trd;
+    }
 
     if (p == PA_BLUETOOTH_PROFILE_HFP_HF) {
         char buf[128];
@@ -848,12 +863,15 @@ static DBusMessage *profile_new_connection(DBusConnection *conn, DBusMessage *m,
         safiesocket_send_rfcomm(fd, buf);
     }
 
-    sco_listen(t);
+    if (p == PA_BLUETOOTH_PROFILE_HFP_HF)
+        sco_listen(t);
 
-    if (p != PA_BLUETOOTH_PROFILE_HFP_HF)
+    if (p != PA_BLUETOOTH_PROFILE_HFP_HF && p != PA_BLUETOOTH_PROFILE_HSP_HS)
         transport_put(t);
 
-    pa_assert_se(r = dbus_message_new_method_return(m));
+    r = dbus_message_new_method_return(m);
+    pa_log_notice("dbus_message_new_method_return(m)=%p", r);
+    pa_assert_se(r);
 
     return r;
 
