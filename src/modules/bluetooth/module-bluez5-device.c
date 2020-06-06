@@ -994,11 +994,13 @@ static void source_set_volume_cb(pa_source *s) {
     pa_cvolume_set(&s->real_volume, u->decoder_sample_spec.channels, volume);
 
     softonly = (u->profile == PA_BLUETOOTH_PROFILE_HFP_HF && !c->mic_gain_supported);
-    pa_log_error("softonly=%d, mic_gain_supported=%d", softonly, c->mic_gain_supported);
+    pa_log_error("s->real_volume=%d, gain=%d, softonly=%d, mic_gain_supported=%d", 
+        s->real_volume, gain, softonly, c->mic_gain_supported);
 
     if (softonly ||
         u->profile == PA_BLUETOOTH_PROFILE_HSP_AG ||
-        u->profile == PA_BLUETOOTH_PROFILE_HFP_AG)
+        u->profile == PA_BLUETOOTH_PROFILE_HFP_AG ||
+        gain == 0)
         pa_cvolume_set(&s->soft_volume, u->decoder_sample_spec.channels, volume);
 
     /* If we are in the AG role, we send a command to the head set to change
@@ -1194,11 +1196,13 @@ static void sink_set_volume_cb(pa_sink *s) {
     /* Set soft volume when in headset role or when in Audio Gateway mode and
        the headset/handsfree does not support remote volume control */
     softonly = (u->profile == PA_BLUETOOTH_PROFILE_HFP_HF && !c->speaker_gain_supported);
-    pa_log_error("softonly=%d, speaker_gain_supported=%d", softonly, c->speaker_gain_supported);
+    pa_log_error("s->real_volume=%d, gain=%d, softonly=%d, speaker_gain_supported=%d", 
+        s->real_volume, gain, softonly, c->speaker_gain_supported);
     
     if (softonly ||
         u->profile == PA_BLUETOOTH_PROFILE_HSP_AG ||
-        u->profile == PA_BLUETOOTH_PROFILE_HFP_AG)
+        u->profile == PA_BLUETOOTH_PROFILE_HFP_AG ||
+        gain == 0)
         pa_cvolume_set(&s->soft_volume, u->encoder_sample_spec.channels, volume);
 
     /* If we are in the AG role, we send a command to the head set to change
