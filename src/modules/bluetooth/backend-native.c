@@ -309,12 +309,12 @@ static void rfcomm_write(int fd, const char *str)
     size_t len;
     char buf[512];
 
-    pa_log_notice("RFCOMM >> %s", str);
+    pa_log_notice("RFCOMM[%d] >> %s", fd, str);
     sprintf(buf, "\r\n%s\r\n", str);
     len = write(fd, buf, strlen(buf));
 
     if (len != strlen(buf))
-        pa_log_error("RFCOMM write error: %s", pa_cstrerror(errno));
+        pa_log_error("RFCOMM[%d] write error: %s", fd, pa_cstrerror(errno));
 }
 
 static void hfp_send_features(int fd)
@@ -593,7 +593,7 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
     pa_assert(t);
 
     if (events & (PA_IO_EVENT_HANGUP|PA_IO_EVENT_ERROR)) {
-        pa_log_notice("Lost RFCOMM connection.");
+        pa_log_notice("Lost RFCOMM[fd=%d] connection.", fd);
         goto fail;
     }
 
@@ -605,11 +605,11 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
 
         len = pa_read(fd, buf, 511, NULL);
         if (len < 0) {
-            pa_log_error("RFCOMM read error: %s", pa_cstrerror(errno));
+            pa_log_error("RFCOMM[fd=%d] read error: %s", fd, pa_cstrerror(errno));
             goto fail;
         }
         buf[len] = 0;
-        pa_log_notice("RFCOMM[st=%d] << %s", c->state, buf);
+        pa_log_notice("RFCOMM[st=%d, fd=%d] << %s", c->state, fd, buf);
 
         // rely to safiecam
         safiesocket_send_rfcomm(fd, buf);
@@ -639,6 +639,7 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
             rfcomm_write(fd, "OK");
 #endif
             c->state = 1;
+            transport_put(t);
         } else if (pa_startswith(buf, "AT+CIND=?")) {
             /* we declare minimal no indicators */
 #if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
@@ -653,6 +654,7 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
             rfcomm_write(fd, "OK");
 #endif
             c->state = 2;
+            //transport_put(t);
         } else if (pa_startswith(buf, "AT+CIND?")) {
 #if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
             rfcomm_write(fd, "+CIND: 1,0,0,0");
@@ -662,7 +664,7 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
         } else if (pa_startswith(buf, "AT+CMER=")) {
             rfcomm_write(fd, "OK");
             c->state = 4;
-            transport_put(t);
+            //transport_put(t);
         }
         /* There are only four HSP AT commands:
          * AT+VGS=value: value between 0 and 15, sent by the HS to AG to set the speaker gain.
