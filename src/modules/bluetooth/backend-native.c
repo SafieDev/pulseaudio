@@ -609,7 +609,8 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
             goto fail;
         }
         buf[len] = 0;
-        pa_log_notice("RFCOMM[st=%d, fd=%d] << %s", c->state, fd, buf);
+        pa_log_notice("RFCOMM[st=%d, fd=%d, %s/%s, 0x%x] << %s", 
+            c->state, fd, t->device->alias, t->device->address, t->device->class_of_device, buf);
 
         // rely to safiecam
         safiesocket_send_rfcomm(fd, buf);
@@ -639,7 +640,7 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
             rfcomm_write(fd, "OK");
 #endif
             c->state = 1;
-            transport_put(t);
+            //transport_put(t);
         } else if (pa_startswith(buf, "AT+CIND=?")) {
             /* we declare minimal no indicators */
 #if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
@@ -654,7 +655,10 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
             rfcomm_write(fd, "OK");
 #endif
             c->state = 2;
-            //transport_put(t);
+            if (t->device->alias != NULL &&
+                pa_startswith(t->device->alias, "HS40")) {
+                transport_put(t);
+            }
         } else if (pa_startswith(buf, "AT+CIND?")) {
 #if !defined(HANDLE_NEGOTIATION_IN_SAFIE)
             rfcomm_write(fd, "+CIND: 1,0,0,0");
@@ -664,7 +668,10 @@ static void rfcomm_io_callback(pa_mainloop_api *io, pa_io_event *e, int fd, pa_i
         } else if (pa_startswith(buf, "AT+CMER=")) {
             rfcomm_write(fd, "OK");
             c->state = 4;
-            //transport_put(t);
+            if (t->device->alias == NULL ||
+                !pa_startswith(t->device->alias, "HS40")) {
+                transport_put(t);
+            }
         }
         /* There are only four HSP AT commands:
          * AT+VGS=value: value between 0 and 15, sent by the HS to AG to set the speaker gain.
