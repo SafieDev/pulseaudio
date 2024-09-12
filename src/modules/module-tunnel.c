@@ -22,6 +22,8 @@
 #include <config.h>
 #endif
 
+#include "restart-module.h"
+
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
@@ -48,7 +50,13 @@
 #include <pulsecore/pstream.h>
 #include <pulsecore/pstream-util.h>
 #include <pulsecore/socket-client.h>
+
+#ifdef USE_SMOOTHER_2
+#include <pulsecore/time-smoother_2.h>
+#else
 #include <pulsecore/time-smoother.h>
+#endif
+
 #include <pulsecore/thread.h>
 #include <pulsecore/thread-mq.h>
 #include <pulsecore/core-rtclock.h>
@@ -75,10 +83,12 @@ PA_MODULE_USAGE(
         "auto=<determine server/sink/cookie automatically> "
         "server=<address> "
         "sink=<remote sink name> "
+        "reconnect_interval_ms=<interval to try reconnects, 0 or omitted if disabled> "
         "cookie=<filename> "
         "format=<sample format> "
         "channels=<number of channels> "
         "rate=<sample rate> "
+        "latency_msec=<fixed latency in ms> "
         "channel_map=<channel map>");
 #else
 PA_MODULE_DESCRIPTION("Tunnel module for sources");
@@ -88,10 +98,12 @@ PA_MODULE_USAGE(
         "auto=<determine server/source/cookie automatically> "
         "server=<address> "
         "source=<remote source name> "
+        "reconnect_interval_ms=<interval to try reconnects, 0 or omitted if disabled> "
         "cookie=<filename> "
         "format=<sample format> "
         "channels=<number of channels> "
         "rate=<sample rate> "
+        "latency_msec=<fixed latency in ms> "
         "channel_map=<channel map>");
 #endif
 
@@ -106,6 +118,8 @@ static const char* const valid_modargs[] = {
     "format",
     "channels",
     "rate",
+    "latency_msec",
+    "reconnect_interval_ms",
 #ifdef TUNNEL_SINK
     "sink_name",
     "sink_properties",
@@ -121,7 +135,7 @@ static const char* const valid_modargs[] = {
 
 #define DEFAULT_TIMEOUT 5
 
-#define LATENCY_INTERVAL (10*PA_USEC_PER_SEC)
+#define LATENCY_INTERVAL (1*PA_USEC_PER_SEC)
 
 #define MIN_NETWORK_LATENCY_USEC (8*PA_USEC_PER_MSEC)
 
@@ -131,23 +145,38 @@ enum {
     SINK_MESSAGE_REQUEST = PA_SINK_MESSAGE_MAX,
     SINK_MESSAGE_REMOTE_SUSPEND,
     SINK_MESSAGE_UPDATE_LATENCY,
-    SINK_MESSAGE_POST
+    SINK_MESSAGE_GET_LATENCY_SNAPSHOT,
+    SINK_MESSAGE_POST,
 };
 
-#define DEFAULT_TLENGTH_MSEC 150
-#define DEFAULT_MINREQ_MSEC 25
+#define DEFAULT_LATENCY_MSEC 100
 
 #else
 
 enum {
     SOURCE_MESSAGE_POST = PA_SOURCE_MESSAGE_MAX,
     SOURCE_MESSAGE_REMOTE_SUSPEND,
-    SOURCE_MESSAGE_UPDATE_LATENCY
+    SOURCE_MESSAGE_UPDATE_LATENCY,
+    SOURCE_MESSAGE_GET_LATENCY_SNAPSHOT,
 };
 
-#define DEFAULT_FRAGSIZE_MSEC 25
+#define DEFAULT_LATENCY_MSEC 25
 
 #endif
+
+struct tunnel_msg {
+    pa_msgobject parent;
+};
+
+typedef struct tunnel_msg tunnel_msg;
+PA_DEFINE_PRIVATE_CLASS(tunnel_msg, pa_msgobject);
+
+enum {
+    TUNNEL_MESSAGE_MAYBE_RESTART,
+};
+
+static int do_init(pa_module *m);
+static void do_done(pa_module *m);
 
 #ifdef TUNNEL_SINK
 static void command_request(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
@@ -197,10 +226,12 @@ struct userdata {
     char *server_name;
 #ifdef TUNNEL_SINK
     char *sink_name;
+    char *configured_sink_name;
     pa_sink *sink;
     size_t requested_bytes;
 #else
     char *source_name;
+    char *configured_source_name;
     pa_source *source;
     pa_mcalign *mcalign;
 #endif
@@ -211,11 +242,15 @@ struct userdata {
     uint32_t ctag;
     uint32_t device_index;
     uint32_t channel;
+    uint32_t latency;
 
-    int64_t counter, counter_delta;
+    int64_t counter;
+    uint64_t receive_counter;
+    uint64_t receive_snapshot;
 
     bool remote_corked:1;
     bool remote_suspended:1;
+    bool shutting_down:1;
 
     pa_usec_t transport_usec; /* maintained in the main thread */
     pa_usec_t thread_transport_usec; /* maintained in the IO thread */
@@ -224,7 +259,11 @@ struct userdata {
 
     pa_time_event *time_event;
 
+#ifdef USE_SMOOTHER_2
+    pa_smoother_2 *smoother;
+#else
     pa_smoother *smoother;
+#endif
 
     char *device_description;
     char *server_fqdn;
@@ -235,12 +274,56 @@ struct userdata {
     uint32_t tlength;
     uint32_t minreq;
     uint32_t prebuf;
+
+    pa_proplist *sink_proplist;
 #else
     uint32_t fragsize;
+
+    pa_proplist *source_proplist;
 #endif
+
+    pa_sample_spec sample_spec;
+    pa_channel_map channel_map;
+
+    tunnel_msg *msg;
+
+    pa_iochannel *io;
+
+    pa_usec_t reconnect_interval_us;
+    pa_usec_t snapshot_time;
+};
+
+struct module_restart_data {
+    struct userdata *userdata;
+    pa_restart_data *restart_data;
 };
 
 static void request_latency(struct userdata *u);
+#ifdef TUNNEL_SINK
+static void create_sink(struct userdata *u);
+static void on_sink_created(struct userdata *u);
+#else
+static void create_source(struct userdata *u);
+static void on_source_created(struct userdata *u);
+#endif
+
+/* Do a reinit of the module.  Note that u will be freed as a result of this
+ * call. */
+static void unload_module(struct module_restart_data *rd) {
+    struct userdata *u = rd->userdata;
+
+    if (rd->restart_data) {
+        pa_log_debug("Restart already pending");
+        return;
+    }
+
+    if (u->reconnect_interval_us > 0) {
+        /* The handle returned here must be freed when do_init() was successful and when the
+         * module exits. */
+        rd->restart_data = pa_restart_module_reinit(u->module, do_init, do_done, u->reconnect_interval_us);
+    } else
+        pa_module_unload_request(u->module, true);
+}
 
 /* Called from main context */
 static void command_stream_or_client_event(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
@@ -257,7 +340,7 @@ static void command_stream_killed(pa_pdispatch *pd,  uint32_t command,  uint32_t
     pa_assert(u->pdispatch == pd);
 
     pa_log_warn("Stream killed");
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 /* Called from main context */
@@ -289,7 +372,7 @@ static void command_suspended(pa_pdispatch *pd,  uint32_t command,  uint32_t tag
         !pa_tagstruct_eof(t)) {
 
         pa_log("Invalid packet.");
-        pa_module_unload_request(u->module, true);
+        unload_module(u->module->userdata);
         return;
     }
 
@@ -322,7 +405,7 @@ static void command_moved(pa_pdispatch *pd,  uint32_t command,  uint32_t tag, pa
         pa_tagstruct_get_boolean(t, &suspended) < 0) {
 
         pa_log_error("Invalid packet.");
-        pa_module_unload_request(u->module, true);
+        unload_module(u->module->userdata);
         return;
     }
 
@@ -351,7 +434,7 @@ static void command_stream_buffer_attr_changed(pa_pdispatch *pd, uint32_t comman
         pa_tagstruct_getu32(t, &maxlength) < 0) {
 
         pa_log_error("Invalid packet.");
-        pa_module_unload_request(u->module, true);
+        unload_module(u->module->userdata);
         return;
     }
 
@@ -360,7 +443,7 @@ static void command_stream_buffer_attr_changed(pa_pdispatch *pd, uint32_t comman
             pa_tagstruct_get_usec(t, &usec) < 0) {
 
             pa_log_error("Invalid packet.");
-            pa_module_unload_request(u->module, true);
+            unload_module(u->module->userdata);
             return;
         }
     } else {
@@ -370,7 +453,7 @@ static void command_stream_buffer_attr_changed(pa_pdispatch *pd, uint32_t comman
             pa_tagstruct_get_usec(t, &usec) < 0) {
 
             pa_log_error("Invalid packet.");
-            pa_module_unload_request(u->module, true);
+            unload_module(u->module->userdata);
             return;
         }
     }
@@ -417,9 +500,15 @@ static void check_smoother_status(struct userdata *u, bool past) {
         x += u->thread_transport_usec;
 
     if (u->remote_suspended || u->remote_corked)
+#ifdef USE_SMOOTHER_2
+        pa_smoother_2_pause(u->smoother, x);
+    else
+        pa_smoother_2_resume(u->smoother, x);
+#else
         pa_smoother_pause(u->smoother, x);
     else
         pa_smoother_resume(u->smoother, x, true);
+#endif
 }
 
 /* Called from IO thread context */
@@ -507,13 +596,25 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
         }
 
         case PA_SINK_MESSAGE_GET_LATENCY: {
-            pa_usec_t yl, yr;
             int64_t *usec = data;
+
+#ifdef USE_SMOOTHER_2
+            *usec = pa_smoother_2_get_delay(u->smoother, pa_rtclock_now(), u->counter);
+#else
+            pa_usec_t yl, yr;
 
             yl = pa_bytes_to_usec((uint64_t) u->counter, &u->sink->sample_spec);
             yr = pa_smoother_get(u->smoother, pa_rtclock_now());
 
             *usec = (int64_t)yl - yr;
+#endif
+            return 0;
+        }
+
+        case SINK_MESSAGE_GET_LATENCY_SNAPSHOT: {
+            int64_t *send_counter = data;
+
+            *send_counter = u->counter;
             return 0;
         }
 
@@ -533,6 +634,22 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
             return 0;
 
         case SINK_MESSAGE_UPDATE_LATENCY: {
+#ifdef USE_SMOOTHER_2
+            int64_t bytes;
+
+            if (offset < 0)
+                bytes = - pa_usec_to_bytes(- offset, &u->sink->sample_spec);
+            else
+                bytes = pa_usec_to_bytes(offset, &u->sink->sample_spec);
+
+            if (u->counter > bytes)
+                bytes = u->counter - bytes;
+            else
+                bytes = 0;
+
+            /* We may use u->snapshot time because the main thread is waiting */
+             pa_smoother_2_put(u->smoother, u->snapshot_time, bytes);
+#else
             pa_usec_t y;
 
             y = pa_bytes_to_usec((uint64_t) u->counter, &u->sink->sample_spec);
@@ -542,7 +659,9 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
             else
                 y = 0;
 
-            pa_smoother_put(u->smoother, pa_rtclock_now(), y);
+            /* We may use u->snapshot time because the main thread is waiting */
+            pa_smoother_put(u->smoother, u->snapshot_time, y);
+#endif
 
             /* We can access this freely here, since the main thread is waiting for us */
             u->thread_transport_usec = u->transport_usec;
@@ -557,9 +676,9 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
              * IO thread context where the rest of the messages are
              * dispatched. Yeah, ugly, but I am a lazy bastard. */
 
-            pa_pstream_send_memblock(u->pstream, u->channel, 0, PA_SEEK_RELATIVE, chunk);
+            pa_pstream_send_memblock(u->pstream, u->channel, 0, PA_SEEK_RELATIVE, chunk, pa_frame_size(&u->sink->sample_spec));
 
-            u->counter_delta += (int64_t) chunk->length;
+            u->receive_counter += chunk->length;
 
             return 0;
     }
@@ -618,13 +737,25 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
         }
 
         case PA_SOURCE_MESSAGE_GET_LATENCY: {
-            pa_usec_t yr, yl;
             int64_t *usec = data;
+
+#ifdef USE_SMOOTHER_2
+            *usec = - pa_smoother_2_get_delay(u->smoother, pa_rtclock_now(), u->counter);
+#else
+            pa_usec_t yr, yl;
 
             yl = pa_bytes_to_usec((uint64_t) u->counter, &PA_SOURCE(o)->sample_spec);
             yr = pa_smoother_get(u->smoother, pa_rtclock_now());
 
             *usec = (int64_t)yr - yl;
+#endif
+            return 0;
+        }
+
+        case SOURCE_MESSAGE_GET_LATENCY_SNAPSHOT: {
+            int64_t *send_counter = data;
+
+            *send_counter = u->counter;
             return 0;
         }
 
@@ -652,12 +783,27 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
             return 0;
 
         case SOURCE_MESSAGE_UPDATE_LATENCY: {
+#ifdef USE_SMOOTHER_2
+            int64_t bytes;
+
+            if (offset < 0)
+                bytes = - pa_usec_to_bytes(- offset, &u->source->sample_spec);
+            else
+                bytes = pa_usec_to_bytes(offset, &u->source->sample_spec);
+
+            bytes += u->counter;
+
+            /* We may use u->snapshot time because the main thread is waiting */
+            pa_smoother_2_put(u->smoother, u->snapshot_time, bytes);
+#else
             pa_usec_t y;
 
             y = pa_bytes_to_usec((uint64_t) u->counter, &u->source->sample_spec);
-            y += (pa_usec_t) offset;
+            y += offset;
 
-            pa_smoother_put(u->smoother, pa_rtclock_now(), y);
+            /* We may use u->snapshot time because the main thread is waiting */
+            pa_smoother_put(u->smoother, u->snapshot_time, y);
+#endif
 
             /* We can access this freely here, since the main thread is waiting for us */
             u->thread_transport_usec = u->transport_usec;
@@ -717,7 +863,7 @@ static void thread_func(void *userdata) {
         int ret;
 
 #ifdef TUNNEL_SINK
-        if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
+        if (u->sink && PA_UNLIKELY(u->sink->thread_info.rewind_requested))
             pa_sink_process_rewind(u->sink, 0);
 #endif
 
@@ -731,7 +877,7 @@ static void thread_func(void *userdata) {
 fail:
     /* If this was no regular exit from the loop we have to continue
      * processing messages until we received PA_MESSAGE_SHUTDOWN */
-    pa_asyncmsgq_post(u->thread_mq.outq, PA_MSGOBJECT(u->core), PA_CORE_MESSAGE_UNLOAD_MODULE, u->module, 0, NULL, NULL);
+    pa_asyncmsgq_post(u->thread_mq.outq, PA_MSGOBJECT(u->msg), TUNNEL_MESSAGE_MAYBE_RESTART, u, 0, NULL, NULL);
     pa_asyncmsgq_wait_for(u->thread_mq.inq, PA_MESSAGE_SHUTDOWN);
 
 finish:
@@ -765,7 +911,7 @@ static void command_request(pa_pdispatch *pd, uint32_t command,  uint32_t tag, p
     return;
 
 fail:
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 #endif
@@ -779,6 +925,9 @@ static void stream_get_latency_callback(pa_pdispatch *pd, uint32_t command, uint
     struct timeval local, remote, now;
     pa_sample_spec *ss;
     int64_t delay;
+#ifdef TUNNEL_SINK
+    uint64_t send_counter;
+#endif
 
     pa_assert(pd);
     pa_assert(u);
@@ -826,7 +975,7 @@ static void stream_get_latency_callback(pa_pdispatch *pd, uint32_t command, uint
     pa_gettimeofday(&now);
 
     /* Calculate transport usec */
-    if (pa_timeval_cmp(&local, &remote) < 0 && pa_timeval_cmp(&remote, &now)) {
+    if (pa_timeval_cmp(&local, &remote) < 0 && pa_timeval_cmp(&remote, &now) < 0) {
         /* local and remote seem to have synchronized clocks */
 #ifdef TUNNEL_SINK
         u->transport_usec = pa_timeval_diff(&remote, &local);
@@ -851,7 +1000,7 @@ static void stream_get_latency_callback(pa_pdispatch *pd, uint32_t command, uint
     else
         delay -= (int64_t) pa_bytes_to_usec((uint64_t) (read_index-write_index), ss);
 
-    /* Our measurements are already out of date, hence correct by the     *
+    /* Our measurements are already out of date, hence correct by the
      * transport latency */
 #ifdef TUNNEL_SINK
     delay -= (int64_t) u->transport_usec;
@@ -859,12 +1008,16 @@ static void stream_get_latency_callback(pa_pdispatch *pd, uint32_t command, uint
     delay += (int64_t) u->transport_usec;
 #endif
 
-    /* Now correct by what we have have read/written since we requested the update */
+    /* Now correct by what we have written since we requested the update. This
+     * is not necessary for the source, because if data is received between request
+     * and reply, it was already posted before we requested the source latency. */
 #ifdef TUNNEL_SINK
-    delay += (int64_t) pa_bytes_to_usec((uint64_t) u->counter_delta, ss);
-#else
-    delay -= (int64_t) pa_bytes_to_usec((uint64_t) u->counter_delta, ss);
+    pa_asyncmsgq_send(u->sink->asyncmsgq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_GET_LATENCY_SNAPSHOT, &send_counter, 0, NULL);
+    delay += (int64_t) pa_bytes_to_usec(send_counter - u->receive_snapshot, ss);
 #endif
+
+    /* It may take some time before the async message is executed, so we take a timestamp here */
+    u->snapshot_time = pa_rtclock_now();
 
 #ifdef TUNNEL_SINK
     pa_asyncmsgq_send(u->sink->asyncmsgq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_UPDATE_LATENCY, 0, delay, NULL);
@@ -876,7 +1029,7 @@ static void stream_get_latency_callback(pa_pdispatch *pd, uint32_t command, uint
 
 fail:
 
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 /* Called from main context */
@@ -901,7 +1054,7 @@ static void request_latency(struct userdata *u) {
     pa_pdispatch_register_reply(u->pdispatch, tag, DEFAULT_TIMEOUT, stream_get_latency_callback, u, NULL);
 
     u->ignore_latency_before = tag;
-    u->counter_delta = 0;
+    u->receive_snapshot = u->receive_counter;
 }
 
 /* Called from main context */
@@ -1011,7 +1164,7 @@ static void server_info_cb(pa_pdispatch *pd, uint32_t command,  uint32_t tag, pa
     return;
 
 fail:
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 static int read_ports(struct userdata *u, pa_tagstruct *t) {
@@ -1034,9 +1187,17 @@ static int read_ports(struct userdata *u, pa_tagstruct *t) {
                 pa_log("Parse failure");
                 return -PA_ERR_PROTOCOL;
             }
-            if (u->version >= 24 && pa_tagstruct_getu32(t, &priority) < 0) { /* available */
-                pa_log("Parse failure");
-                return -PA_ERR_PROTOCOL;
+            if (u->version >= 24) {
+                if (pa_tagstruct_getu32(t, &priority) < 0) { /* available */
+                    pa_log("Parse failure");
+                    return -PA_ERR_PROTOCOL;
+                }
+                if (u->version >= 34 &&
+                    (pa_tagstruct_gets(t, &s) < 0 || /* availability group */
+                     pa_tagstruct_getu32(t, &priority) < 0)) { /* device port type */
+                    pa_log("Parse failure");
+                    return -PA_ERR_PROTOCOL;
+                }
             }
         }
 
@@ -1158,7 +1319,7 @@ static void sink_info_cb(pa_pdispatch *pd, uint32_t command,  uint32_t tag, pa_t
     return;
 
 fail:
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 /* Called from main context */
@@ -1267,7 +1428,7 @@ static void sink_input_info_cb(pa_pdispatch *pd, uint32_t command,  uint32_t tag
     return;
 
 fail:
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 #else
@@ -1357,7 +1518,7 @@ static void source_info_cb(pa_pdispatch *pd, uint32_t command,  uint32_t tag, pa
     return;
 
 fail:
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 #endif
@@ -1418,7 +1579,7 @@ static void command_subscribe_event(pa_pdispatch *pd,  uint32_t command,  uint32
     if (pa_tagstruct_getu32(t, &e) < 0 ||
         pa_tagstruct_getu32(t, &idx) < 0) {
         pa_log("Invalid protocol reply");
-        pa_module_unload_request(u->module, true);
+        unload_module(u->module->userdata);
         return;
     }
 
@@ -1565,7 +1726,7 @@ parse_error:
     pa_log("Invalid reply. (Create stream)");
 
 fail:
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 
 }
 
@@ -1650,11 +1811,11 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
         u->maxlength = 4*1024*1024;
 
 #ifdef TUNNEL_SINK
-    u->tlength = (uint32_t) pa_usec_to_bytes(PA_USEC_PER_MSEC * DEFAULT_TLENGTH_MSEC, &u->sink->sample_spec);
-    u->minreq = (uint32_t) pa_usec_to_bytes(PA_USEC_PER_MSEC * DEFAULT_MINREQ_MSEC, &u->sink->sample_spec);
+    u->tlength = (uint32_t) pa_usec_to_bytes(PA_USEC_PER_MSEC * u->latency, &u->sink->sample_spec);
+    u->minreq = (uint32_t) pa_usec_to_bytes(PA_USEC_PER_MSEC * u->latency / 4, &u->sink->sample_spec);
     u->prebuf = u->tlength;
 #else
-    u->fragsize = (uint32_t) pa_usec_to_bytes(PA_USEC_PER_MSEC * DEFAULT_FRAGSIZE_MSEC, &u->source->sample_spec);
+    u->fragsize = (uint32_t) pa_usec_to_bytes(PA_USEC_PER_MSEC * u->latency, &u->source->sample_spec);
 #endif
 
 #ifdef TUNNEL_SINK
@@ -1769,7 +1930,7 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
     return;
 
 fail:
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 /* Called from main context */
@@ -1780,7 +1941,7 @@ static void pstream_die_callback(pa_pstream *p, void *userdata) {
     pa_assert(u);
 
     pa_log_warn("Stream died.");
-    pa_module_unload_request(u->module, true);
+    unload_module(u->module->userdata);
 }
 
 /* Called from main context */
@@ -1793,7 +1954,7 @@ static void pstream_packet_callback(pa_pstream *p, pa_packet *packet, pa_cmsg_an
 
     if (pa_pdispatch_run(u->pdispatch, packet, ancil_data, u) < 0) {
         pa_log("Invalid packet");
-        pa_module_unload_request(u->module, true);
+        unload_module(u->module->userdata);
         return;
     }
 }
@@ -1809,21 +1970,21 @@ static void pstream_memblock_callback(pa_pstream *p, uint32_t channel, int64_t o
 
     if (channel != u->channel) {
         pa_log("Received memory block on bad channel.");
-        pa_module_unload_request(u->module, true);
+        unload_module(u->module->userdata);
         return;
     }
 
     pa_asyncmsgq_send(u->source->asyncmsgq, PA_MSGOBJECT(u->source), SOURCE_MESSAGE_POST, PA_UINT_TO_PTR(seek), offset, chunk);
 
-    u->counter_delta += (int64_t) chunk->length;
+    u->receive_counter += chunk->length;
 }
 #endif
 
 /* Called from main context */
 static void on_connection(pa_socket_client *sc, pa_iochannel *io, void *userdata) {
     struct userdata *u = userdata;
-    pa_tagstruct *t;
-    uint32_t tag;
+
+    pa_assert_ctl_context();
 
     pa_assert(sc);
     pa_assert(u);
@@ -1834,11 +1995,39 @@ static void on_connection(pa_socket_client *sc, pa_iochannel *io, void *userdata
 
     if (!io) {
         pa_log("Connection failed: %s", pa_cstrerror(errno));
-        pa_module_unload_request(u->module, true);
+        unload_module(u->module->userdata);
         return;
     }
 
-    u->pstream = pa_pstream_new(u->core->mainloop, io, u->core->mempool);
+    u->io = io;
+
+#ifdef TUNNEL_SINK
+    create_sink(u);
+    if (!u->sink) {
+        unload_module(u->module->userdata);
+        return;
+    }
+    on_sink_created(u);
+#else
+    create_source(u);
+    if (!u->source) {
+        unload_module(u->module->userdata);
+        return;
+    }
+    on_source_created(u);
+#endif
+}
+
+#ifdef TUNNEL_SINK
+static void on_sink_created(struct userdata *u)
+#else
+static void on_source_created(struct userdata *u)
+#endif
+{
+    pa_tagstruct *t;
+    uint32_t tag;
+
+    u->pstream = pa_pstream_new(u->core->mainloop, u->io, u->core->mempool);
     u->pdispatch = pa_pdispatch_new(u->core->mainloop, true, command_table, PA_COMMAND_MAX);
 
     pa_pstream_set_die_callback(u->pstream, pstream_die_callback, u);
@@ -1858,8 +2047,8 @@ static void on_connection(pa_socket_client *sc, pa_iochannel *io, void *userdata
 {
     pa_creds ucred;
 
-    if (pa_iochannel_creds_supported(io))
-        pa_iochannel_creds_enable(io);
+    if (pa_iochannel_creds_supported(u->io))
+        pa_iochannel_creds_enable(u->io);
 
     ucred.uid = getuid();
     ucred.gid = getgid();
@@ -1916,33 +2105,211 @@ static void sink_set_mute(pa_sink *sink) {
 
 #endif
 
-int pa__init(pa_module*m) {
+#ifdef TUNNEL_SINK
+static void create_sink(struct userdata *u) {
+    pa_sink_new_data data;
+    char *data_name = NULL;
+
+    if (!(data_name = pa_xstrdup(u->configured_sink_name)))
+        data_name = pa_sprintf_malloc("tunnel-sink.%s", u->server_name);
+
+    pa_sink_new_data_init(&data);
+    data.driver = __FILE__;
+    data.module = u->module;
+    data.namereg_fail = false;
+    pa_sink_new_data_set_name(&data, data_name);
+    pa_sink_new_data_set_sample_spec(&data, &u->sample_spec);
+    pa_sink_new_data_set_channel_map(&data, &u->channel_map);
+    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "%s%s%s", pa_strempty(u->sink_name), u->sink_name ? " on " : "", u->server_name);
+    pa_proplist_sets(data.proplist, "tunnel.remote.server", u->server_name);
+    if (u->sink_name)
+        pa_proplist_sets(data.proplist, "tunnel.remote.sink", u->sink_name);
+
+    pa_proplist_update(data.proplist, PA_UPDATE_REPLACE, u->sink_proplist);
+
+    u->sink = pa_sink_new(u->module->core, &data, PA_SINK_NETWORK|PA_SINK_LATENCY);
+
+    if (!u->sink) {
+        pa_log("Failed to create sink.");
+        goto finish;
+    }
+
+    u->sink->parent.process_msg = sink_process_msg;
+    u->sink->userdata = u;
+    u->sink->set_state_in_main_thread = sink_set_state_in_main_thread_cb;
+    pa_sink_set_set_volume_callback(u->sink, sink_set_volume);
+    pa_sink_set_set_mute_callback(u->sink, sink_set_mute);
+
+    u->sink->refresh_volume = u->sink->refresh_muted = false;
+
+/*     pa_sink_set_latency_range(u->sink, MIN_NETWORK_LATENCY_USEC, 0); */
+
+    pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
+    pa_sink_set_rtpoll(u->sink, u->rtpoll);
+    pa_sink_set_fixed_latency(u->sink, u->latency * PA_USEC_PER_MSEC);
+
+    pa_sink_put(u->sink);
+
+finish:
+    pa_sink_new_data_done(&data);
+    pa_xfree(data_name);
+}
+#else
+static void create_source(struct userdata *u) {
+    pa_source_new_data data;
+    char *data_name = NULL;
+
+    if (!(data_name = pa_xstrdup(u->configured_source_name)))
+        data_name = pa_sprintf_malloc("tunnel-source.%s", u->server_name);
+
+    pa_source_new_data_init(&data);
+    data.driver = __FILE__;
+    data.module = u->module;
+    data.namereg_fail = false;
+    pa_source_new_data_set_name(&data, data_name);
+    pa_source_new_data_set_sample_spec(&data, &u->sample_spec);
+    pa_source_new_data_set_channel_map(&data, &u->channel_map);
+    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "%s%s%s", pa_strempty(u->source_name), u->source_name ? " on " : "", u->server_name);
+    pa_proplist_sets(data.proplist, "tunnel.remote.server", u->server_name);
+    if (u->source_name)
+        pa_proplist_sets(data.proplist, "tunnel.remote.source", u->source_name);
+
+    pa_proplist_update(data.proplist, PA_UPDATE_REPLACE, u->source_proplist);
+
+    u->source = pa_source_new(u->module->core, &data, PA_SOURCE_NETWORK|PA_SOURCE_LATENCY);
+
+    if (!u->source) {
+        pa_log("Failed to create source.");
+        goto finish;
+    }
+
+    u->source->parent.process_msg = source_process_msg;
+    u->source->set_state_in_main_thread = source_set_state_in_main_thread_cb;
+    u->source->userdata = u;
+
+/*     pa_source_set_latency_range(u->source, MIN_NETWORK_LATENCY_USEC, 0); */
+
+    pa_source_set_asyncmsgq(u->source, u->thread_mq.inq);
+    pa_source_set_rtpoll(u->source, u->rtpoll);
+    pa_source_set_fixed_latency(u->source, u->latency * PA_USEC_PER_MSEC);
+
+    u->mcalign = pa_mcalign_new(pa_frame_size(&u->source->sample_spec));
+
+    pa_source_put(u->source);
+
+finish:
+    pa_source_new_data_done(&data);
+    pa_xfree(data_name);
+}
+#endif
+
+/* Runs in PA mainloop context */
+static int tunnel_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
+    struct userdata *u = (struct userdata *) data;
+
+    pa_assert(u);
+    pa_assert_ctl_context();
+
+    if (u->shutting_down)
+        return 0;
+
+    switch (code) {
+
+        case TUNNEL_MESSAGE_MAYBE_RESTART:
+            unload_module(u->module->userdata);
+            break;
+    }
+
+    return 0;
+}
+
+static int start_connect(struct userdata *u, char *server, bool automatic) {
+    pa_strlist *server_list = NULL;
+    int rc = 0;
+
+    if (server) {
+        if (!(server_list = pa_strlist_parse(server))) {
+            pa_log("Invalid server specified.");
+            rc = -1;
+            goto done;
+        }
+    } else {
+        char *ufn;
+
+        if (!automatic) {
+            pa_log("No server specified.");
+            rc = -1;
+            goto done;
+        }
+
+        pa_log("No server address found. Attempting default local sockets.");
+
+        /* The system wide instance via PF_LOCAL */
+        server_list = pa_strlist_prepend(server_list, PA_SYSTEM_RUNTIME_PATH PA_PATH_SEP PA_NATIVE_DEFAULT_UNIX_SOCKET);
+
+        /* The user instance via PF_LOCAL */
+        if ((ufn = pa_runtime_path(PA_NATIVE_DEFAULT_UNIX_SOCKET))) {
+            server_list = pa_strlist_prepend(server_list, ufn);
+            pa_xfree(ufn);
+        }
+    }
+
+    for (;;) {
+        server_list = pa_strlist_pop(server_list, &u->server_name);
+
+        if (!u->server_name) {
+            if (server)
+                pa_log("Failed to connect to server '%s'", server);
+            else
+                pa_log("Failed to connect");
+            rc = -1;
+            goto done;
+        }
+
+        pa_log_debug("Trying to connect to %s...", u->server_name);
+
+        if (!(u->client = pa_socket_client_new_string(u->module->core->mainloop, true, u->server_name, PA_NATIVE_DEFAULT_PORT))) {
+            pa_xfree(u->server_name);
+            u->server_name = NULL;
+            continue;
+        }
+
+        break;
+    }
+
+    if (u->client)
+        pa_socket_client_set_callback(u->client, on_connection, u);
+
+done:
+    pa_strlist_free(server_list);
+
+    return rc;
+}
+
+static int do_init(pa_module *m) {
     pa_modargs *ma = NULL;
     struct userdata *u = NULL;
+    struct module_restart_data *rd;
     char *server = NULL;
-    pa_strlist *server_list = NULL;
-    pa_sample_spec ss;
-    pa_channel_map map;
-    char *dn = NULL;
-#ifdef TUNNEL_SINK
-    pa_sink_new_data data;
-#else
-    pa_source_new_data data;
-#endif
+    uint32_t latency_msec;
     bool automatic;
 #ifdef HAVE_X11
     xcb_connection_t *xcb = NULL;
 #endif
     const char *cookie_path;
+    uint32_t reconnect_interval_ms = 0;
 
     pa_assert(m);
+    pa_assert(m->userdata);
+
+    rd = m->userdata;
 
     if (!(ma = pa_modargs_new(m->argument, valid_modargs))) {
         pa_log("Failed to parse module arguments");
         goto fail;
     }
 
-    m->userdata = u = pa_xnew0(struct userdata, 1);
+    rd->userdata = u = pa_xnew0(struct userdata, 1);
     u->core = m->core;
     u->module = m;
     u->client = NULL;
@@ -1951,12 +2318,15 @@ int pa__init(pa_module*m) {
     u->server_name = NULL;
 #ifdef TUNNEL_SINK
     u->sink_name = pa_xstrdup(pa_modargs_get_value(ma, "sink", NULL));;
+    u->configured_sink_name = pa_xstrdup(pa_modargs_get_value(ma, "sink_name", NULL));
     u->sink = NULL;
     u->requested_bytes = 0;
 #else
     u->source_name = pa_xstrdup(pa_modargs_get_value(ma, "source", NULL));;
+    u->configured_source_name = pa_xstrdup(pa_modargs_get_value(ma, "source_name", NULL));
     u->source = NULL;
 #endif
+#ifndef USE_SMOOTHER_2
     u->smoother = pa_smoother_new(
             PA_USEC_PER_SEC,
             PA_USEC_PER_SEC*2,
@@ -1965,13 +2335,19 @@ int pa__init(pa_module*m) {
             10,
             pa_rtclock_now(),
             false);
+#endif
     u->ctag = 1;
     u->device_index = u->channel = PA_INVALID_INDEX;
     u->time_event = NULL;
     u->ignore_latency_before = 0;
     u->transport_usec = u->thread_transport_usec = 0;
     u->remote_suspended = u->remote_corked = false;
-    u->counter = u->counter_delta = 0;
+    u->counter = 0;
+    u->receive_snapshot = 0;
+    u->receive_counter = 0;
+
+    u->msg = pa_msgobject_new(tunnel_msg);
+    u->msg->parent.process_msg = tunnel_process_msg;
 
     u->rtpoll = pa_rtpoll_new();
 
@@ -1980,10 +2356,20 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
+    automatic = false;
     if (pa_modargs_get_value_boolean(ma, "auto", &automatic) < 0) {
         pa_log("Failed to parse argument \"auto\".");
         goto fail;
     }
+
+    /* Allow latencies between 5ms and 500ms */
+    latency_msec = DEFAULT_LATENCY_MSEC;
+    if (pa_modargs_get_value_u32(ma, "latency_msec", &latency_msec) < 0 || latency_msec < 5 || latency_msec > 500) {
+        pa_log("Invalid latency specification");
+        goto fail;
+    }
+
+    u->latency = latency_msec;
 
     cookie_path = pa_modargs_get_value(ma, "cookie", NULL);
     server = pa_xstrdup(pa_modargs_get_value(ma, "server", NULL));
@@ -2070,144 +2456,37 @@ int pa__init(pa_module*m) {
             goto fail;
     }
 
-    if (server) {
-        if (!(server_list = pa_strlist_parse(server))) {
-            pa_log("Invalid server specified.");
-            goto fail;
-        }
-    } else {
-        char *ufn;
-
-        if (!automatic) {
-            pa_log("No server specified.");
-            goto fail;
-        }
-
-        pa_log("No server address found. Attempting default local sockets.");
-
-        /* The system wide instance via PF_LOCAL */
-        server_list = pa_strlist_prepend(server_list, PA_SYSTEM_RUNTIME_PATH PA_PATH_SEP PA_NATIVE_DEFAULT_UNIX_SOCKET);
-
-        /* The user instance via PF_LOCAL */
-        if ((ufn = pa_runtime_path(PA_NATIVE_DEFAULT_UNIX_SOCKET))) {
-            server_list = pa_strlist_prepend(server_list, ufn);
-            pa_xfree(ufn);
-        }
-    }
-
-    ss = m->core->default_sample_spec;
-    map = m->core->default_channel_map;
-    if (pa_modargs_get_sample_spec_and_channel_map(ma, &ss, &map, PA_CHANNEL_MAP_DEFAULT) < 0) {
+    u->sample_spec = m->core->default_sample_spec;
+    u->channel_map = m->core->default_channel_map;
+    if (pa_modargs_get_sample_spec_and_channel_map(ma, &u->sample_spec, &u->channel_map, PA_CHANNEL_MAP_DEFAULT) < 0) {
         pa_log("Invalid sample format specification");
         goto fail;
     }
 
-    for (;;) {
-        server_list = pa_strlist_pop(server_list, &u->server_name);
+#ifdef USE_SMOOTHER_2
+    /* Smoother window must be larger than time between updates. */
+    u->smoother = pa_smoother_2_new(LATENCY_INTERVAL + 5*PA_USEC_PER_SEC, pa_rtclock_now(), pa_frame_size(&u->sample_spec), u->sample_spec.rate);
+#endif
 
-        if (!u->server_name) {
-            pa_log("Failed to connect to server '%s'", server);
-            goto fail;
-        }
-
-        pa_log_debug("Trying to connect to %s...", u->server_name);
-
-        if (!(u->client = pa_socket_client_new_string(m->core->mainloop, true, u->server_name, PA_NATIVE_DEFAULT_PORT))) {
-            pa_xfree(u->server_name);
-            u->server_name = NULL;
-            continue;
-        }
-
-        break;
-     }
-
-    pa_socket_client_set_callback(u->client, on_connection, u);
+    pa_modargs_get_value_u32(ma, "reconnect_interval_ms", &reconnect_interval_ms);
+    u->reconnect_interval_us = reconnect_interval_ms * PA_USEC_PER_MSEC;
 
 #ifdef TUNNEL_SINK
 
-    if (!(dn = pa_xstrdup(pa_modargs_get_value(ma, "sink_name", NULL))))
-        dn = pa_sprintf_malloc("tunnel-sink.%s", u->server_name);
-
-    pa_sink_new_data_init(&data);
-    data.driver = __FILE__;
-    data.module = m;
-    data.namereg_fail = false;
-    pa_sink_new_data_set_name(&data, dn);
-    pa_sink_new_data_set_sample_spec(&data, &ss);
-    pa_sink_new_data_set_channel_map(&data, &map);
-    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "%s%s%s", pa_strempty(u->sink_name), u->sink_name ? " on " : "", u->server_name);
-    pa_proplist_sets(data.proplist, "tunnel.remote.server", u->server_name);
-    if (u->sink_name)
-        pa_proplist_sets(data.proplist, "tunnel.remote.sink", u->sink_name);
-
-    if (pa_modargs_get_proplist(ma, "sink_properties", data.proplist, PA_UPDATE_REPLACE) < 0) {
+    u->sink_proplist = pa_proplist_new();
+    if (pa_modargs_get_proplist(ma, "sink_properties", u->sink_proplist, PA_UPDATE_REPLACE) < 0) {
         pa_log("Invalid properties");
-        pa_sink_new_data_done(&data);
         goto fail;
     }
-
-    u->sink = pa_sink_new(m->core, &data, PA_SINK_NETWORK|PA_SINK_LATENCY);
-    pa_sink_new_data_done(&data);
-
-    if (!u->sink) {
-        pa_log("Failed to create sink.");
-        goto fail;
-    }
-
-    u->sink->parent.process_msg = sink_process_msg;
-    u->sink->userdata = u;
-    u->sink->set_state_in_main_thread = sink_set_state_in_main_thread_cb;
-    pa_sink_set_set_volume_callback(u->sink, sink_set_volume);
-    pa_sink_set_set_mute_callback(u->sink, sink_set_mute);
-
-    u->sink->refresh_volume = u->sink->refresh_muted = false;
-
-/*     pa_sink_set_latency_range(u->sink, MIN_NETWORK_LATENCY_USEC, 0); */
-
-    pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
-    pa_sink_set_rtpoll(u->sink, u->rtpoll);
 
 #else
 
-    if (!(dn = pa_xstrdup(pa_modargs_get_value(ma, "source_name", NULL))))
-        dn = pa_sprintf_malloc("tunnel-source.%s", u->server_name);
-
-    pa_source_new_data_init(&data);
-    data.driver = __FILE__;
-    data.module = m;
-    data.namereg_fail = false;
-    pa_source_new_data_set_name(&data, dn);
-    pa_source_new_data_set_sample_spec(&data, &ss);
-    pa_source_new_data_set_channel_map(&data, &map);
-    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "%s%s%s", pa_strempty(u->source_name), u->source_name ? " on " : "", u->server_name);
-    pa_proplist_sets(data.proplist, "tunnel.remote.server", u->server_name);
-    if (u->source_name)
-        pa_proplist_sets(data.proplist, "tunnel.remote.source", u->source_name);
-
-    if (pa_modargs_get_proplist(ma, "source_properties", data.proplist, PA_UPDATE_REPLACE) < 0) {
+    u->source_proplist = pa_proplist_new();
+    if (pa_modargs_get_proplist(ma, "source_properties", u->source_proplist, PA_UPDATE_REPLACE) < 0) {
         pa_log("Invalid properties");
-        pa_source_new_data_done(&data);
         goto fail;
     }
 
-    u->source = pa_source_new(m->core, &data, PA_SOURCE_NETWORK|PA_SOURCE_LATENCY);
-    pa_source_new_data_done(&data);
-
-    if (!u->source) {
-        pa_log("Failed to create source.");
-        goto fail;
-    }
-
-    u->source->parent.process_msg = source_process_msg;
-    u->source->set_state_in_main_thread = source_set_state_in_main_thread_cb;
-    u->source->userdata = u;
-
-/*     pa_source_set_latency_range(u->source, MIN_NETWORK_LATENCY_USEC, 0); */
-
-    pa_source_set_asyncmsgq(u->source, u->thread_mq.inq);
-    pa_source_set_rtpoll(u->source, u->rtpoll);
-
-    u->mcalign = pa_mcalign_new(pa_frame_size(&u->source->sample_spec));
 #endif
 
     u->time_event = NULL;
@@ -2219,42 +2498,40 @@ int pa__init(pa_module*m) {
     u->fragsize = (uint32_t) -1;
 #endif
 
+    if (start_connect(u, server, automatic) < 0) {
+        goto fail;
+    }
+
     if (!(u->thread = pa_thread_new("module-tunnel", thread_func, u))) {
         pa_log("Failed to create thread.");
         goto fail;
     }
 
-#ifdef TUNNEL_SINK
-    pa_sink_put(u->sink);
-#else
-    pa_source_put(u->source);
-#endif
-
-    pa_xfree(dn);
-
     if (server)
         pa_xfree(server);
-
-    if (server_list)
-        pa_strlist_free(server_list);
 
 #ifdef HAVE_X11
     if (xcb)
         xcb_disconnect(xcb);
 #endif
 
+    /* If the module is restarting and do_init() finishes successfully, the
+     * restart data is no longer needed. If do_init() fails, don't touch the
+     * restart data, because following restart attempts will continue to use
+     * the same data. If restart_data is NULL, that means no restart is
+     * currently pending. */
+    if (rd->restart_data) {
+        pa_restart_free(rd->restart_data);
+        rd->restart_data = NULL;
+    }
+
     pa_modargs_free(ma);
 
     return 0;
 
 fail:
-    pa__done(m);
-
     if (server)
         pa_xfree(server);
-
-    if (server_list)
-        pa_strlist_free(server_list);
 
 #ifdef HAVE_X11
     if (xcb)
@@ -2264,18 +2541,21 @@ fail:
     if (ma)
         pa_modargs_free(ma);
 
-    pa_xfree(dn);
-
     return -1;
 }
 
-void pa__done(pa_module*m) {
-    struct userdata* u;
+static void do_done(pa_module *m) {
+    struct userdata *u = NULL;
+    struct module_restart_data *rd;
 
     pa_assert(m);
 
-    if (!(u = m->userdata))
+    if (!(rd = m->userdata))
         return;
+    if (!(u = rd->userdata))
+        return;
+
+    u->shutting_down = true;
 
 #ifdef TUNNEL_SINK
     if (u->sink)
@@ -2318,7 +2598,11 @@ void pa__done(pa_module*m) {
         pa_auth_cookie_unref(u->auth_cookie);
 
     if (u->smoother)
+#ifdef USE_SMOOTHER_2
+        pa_smoother_2_free(u->smoother);
+#else
         pa_smoother_free(u->smoother);
+#endif
 
     if (u->time_event)
         u->core->mainloop->time_free(u->time_event);
@@ -2330,8 +2614,12 @@ void pa__done(pa_module*m) {
 
 #ifdef TUNNEL_SINK
     pa_xfree(u->sink_name);
+    pa_xfree(u->configured_sink_name);
+    pa_proplist_free(u->sink_proplist);
 #else
     pa_xfree(u->source_name);
+    pa_xfree(u->configured_source_name);
+    pa_proplist_free(u->source_proplist);
 #endif
     pa_xfree(u->server_name);
 
@@ -2339,5 +2627,39 @@ void pa__done(pa_module*m) {
     pa_xfree(u->server_fqdn);
     pa_xfree(u->user_name);
 
+    pa_xfree(u->msg);
+
     pa_xfree(u);
+
+    rd->userdata = NULL;
+}
+
+int pa__init(pa_module *m) {
+    int ret;
+
+    pa_assert(m);
+
+    m->userdata = pa_xnew0(struct module_restart_data, 1);
+
+    ret = do_init(m);
+
+    if (ret < 0)
+        pa__done(m);
+
+    return ret;
+}
+
+void pa__done(pa_module *m) {
+    pa_assert(m);
+
+    do_done(m);
+
+    if (m->userdata) {
+        struct module_restart_data *rd = m->userdata;
+
+        if (rd->restart_data)
+            pa_restart_free(rd->restart_data);
+
+        pa_xfree(m->userdata);
+    }
 }

@@ -681,7 +681,7 @@ static void help(const char *argv0) {
              "  -p, --playback                        Create a connection for playback\n\n"
              "  -v, --verbose                         Enable verbose operations\n\n"
              "  -s, --server=SERVER                   The name of the server to connect to\n"
-             "  -d, --device=DEVICE                   The name of the sink/source to connect to\n"
+             "  -d, --device=DEVICE                   The name of the sink/source to connect to. The special names @DEFAULT_SINK@, @DEFAULT_SOURCE@ and @DEFAULT_MONITOR@ can be used to specify the default sink, source and monitor respectively.\n"
              "  -n, --client-name=NAME                How to call this client on the server\n"
              "      --stream-name=NAME                How to call this stream on the server\n"
              "      --volume=VOLUME                   Specify the initial (linear) volume in range 0...65536\n"
@@ -1062,6 +1062,18 @@ int main(int argc, char *argv[]) {
             }
 
             sfi.format |= file_format;
+
+	    /*
+	     * Endianness has been set in pa_sndfile_write_sample_spec(), but
+	     * libsndfile errors out if endianness is set to anything other than
+	     * SF_ENDIAN_FILE for OGG or FLAC. Clear it.
+	     * For OGG, libsndfile accepts only subformat SF_FORMAT_VORBIS.
+	     */
+	    if (file_format == SF_FORMAT_OGG || file_format == SF_FORMAT_FLAC)
+		    sfi.format = (sfi.format & ~SF_FORMAT_ENDMASK) | SF_ENDIAN_FILE;
+	    if (file_format == SF_FORMAT_OGG)
+		    sfi.format = (sfi.format & ~SF_FORMAT_SUBMASK) | SF_FORMAT_VORBIS;
+
         }
 
         if (!(sndfile = sf_open_fd(mode == RECORD ? STDOUT_FILENO : STDIN_FILENO,

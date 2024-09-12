@@ -1,19 +1,38 @@
 
 # man page name, section, [aliases]
-manpages = [
-  ['default.pa', '5'],
-  ['pacat', '1', ['paplay', 'parec', 'parecord', 'pamon']],
-  ['pacmd', '1'],
-  ['pactl', '1'],
-  ['padsp', '1'],
-  ['pasuspender', '1'],
-  ['pax11publish', '1'],
-  ['pulse-cli-syntax', '5'],
-  ['pulse-client.conf', '5'],
-  ['pulse-daemon.conf', '5'],
-  ['pulseaudio', '1'],
-  ['start-pulseaudio-x11', '1'],
-]
+manpages = []
+
+if get_option('daemon')
+  manpages += [
+    ['default.pa', '5'],
+    ['pacmd', '1'],
+    ['pasuspender', '1'],
+    ['pulse-cli-syntax', '5'],
+    ['pulse-daemon.conf', '5'],
+    ['pulseaudio', '1'],
+    ['start-pulseaudio-x11', '1'],
+  ]
+endif
+
+if get_option('client')
+  manpages += [
+    ['pacat', '1', ['paplay', 'parec', 'parecord', 'pamon']],
+    ['pactl', '1'],
+    ['pulse-client.conf', '5'],
+  ]
+
+  if cdata.has('HAVE_OSS_WRAPPER')
+    manpages += [
+      ['padsp', '1'],
+    ]
+  endif
+
+  if x11_dep.found()
+    manpages += [
+      ['pax11publish', '1'],
+    ]
+  endif
+endif
 
 # FIXME: Add esdcompat if HAVE_ESOUND
 #manpages += ['esdcompat', '1'],

@@ -47,7 +47,12 @@
 #include <pulsecore/thread.h>
 #include <pulsecore/thread-mq.h>
 #include <pulsecore/rtpoll.h>
+
+#ifdef USE_SMOOTHER_2
+#include <pulsecore/time-smoother_2.h>
+#else
 #include <pulsecore/time-smoother.h>
+#endif
 
 #include <modules/reserve-wrap.h>
 
@@ -71,11 +76,15 @@
 #define TSCHED_MIN_SLEEP_USEC (10*PA_USEC_PER_MSEC)                /* 10ms */
 #define TSCHED_MIN_WAKEUP_USEC (4*PA_USEC_PER_MSEC)                /* 4ms */
 
+#ifdef USE_SMOOTHER_2
+#define SMOOTHER_WINDOW_USEC  (15*PA_USEC_PER_SEC)                 /* 15s */
+#else
 #define SMOOTHER_WINDOW_USEC  (10*PA_USEC_PER_SEC)                 /* 10s */
 #define SMOOTHER_ADJUST_USEC  (1*PA_USEC_PER_SEC)                  /* 1s */
 
 #define SMOOTHER_MIN_INTERVAL (2*PA_USEC_PER_MSEC)                 /* 2ms */
 #define SMOOTHER_MAX_INTERVAL (200*PA_USEC_PER_MSEC)               /* 200ms */
+#endif
 
 #define VOLUME_ACCURACY (PA_VOLUME_NORM/100)
 
@@ -140,10 +149,17 @@ struct userdata {
 
     pa_rtpoll_item *alsa_rtpoll_item;
 
+#ifdef USE_SMOOTHER_2
+    pa_smoother_2 *smoother;
+#else
     pa_smoother *smoother;
+#endif
     uint64_t read_count;
+
+#ifndef USE_SMOOTHER_2
     pa_usec_t smoother_interval;
     pa_usec_t last_smoother_update;
+#endif
 
     pa_reserve_wrapper *reserve;
     pa_hook_slot *reserve_slot;
@@ -452,9 +468,13 @@ static void hw_sleep_time(struct userdata *u, pa_usec_t *sleep_usec, pa_usec_t*p
 /* Reset smoother and counters */
 static void reset_vars(struct userdata *u) {
 
+#ifdef USE_SMOOTHER_2
+    pa_smoother_2_reset(u->smoother, pa_rtclock_now());
+#else
     pa_smoother_reset(u->smoother, pa_rtclock_now(), true);
     u->smoother_interval = SMOOTHER_MIN_INTERVAL;
     u->last_smoother_update = 0;
+#endif
 
     u->read_count = 0;
     u->first = true;
@@ -462,7 +482,12 @@ static void reset_vars(struct userdata *u) {
 
 /* Called from IO context */
 static void close_pcm(struct userdata *u) {
+
+#ifdef USE_SMOOTHER_2
+    pa_smoother_2_pause(u->smoother, pa_rtclock_now());
+#else
     pa_smoother_pause(u->smoother, pa_rtclock_now());
+#endif
 
     /* Let's suspend */
     snd_pcm_close(u->pcm_handle);
@@ -877,7 +902,10 @@ static void update_smoother(struct userdata *u) {
     snd_pcm_sframes_t delay = 0;
     uint64_t position;
     int err;
-    pa_usec_t now1 = 0, now2;
+    pa_usec_t now1 = 0;
+#ifndef USE_SMOOTHER_2
+    pa_usec_t now2;
+#endif
     snd_pcm_status_t *status;
     snd_htimestamp_t htstamp = { 0, 0 };
 
@@ -900,12 +928,16 @@ static void update_smoother(struct userdata *u) {
     if (now1 <= 0)
         now1 = pa_rtclock_now();
 
+    position = u->read_count + ((uint64_t) delay * (uint64_t) u->frame_size);
+
+#ifdef USE_SMOOTHER_2
+    pa_smoother_2_put(u->smoother, now1, position);
+#else
     /* check if the time since the last update is bigger than the interval */
     if (u->last_smoother_update > 0)
         if (u->last_smoother_update + u->smoother_interval > now1)
             return;
 
-    position = u->read_count + ((uint64_t) delay * (uint64_t) u->frame_size);
     now2 = pa_bytes_to_usec(position, &u->source->sample_spec);
 
     pa_smoother_put(u->smoother, now1, now2);
@@ -913,18 +945,27 @@ static void update_smoother(struct userdata *u) {
     u->last_smoother_update = now1;
     /* exponentially increase the update interval up to the MAX limit */
     u->smoother_interval = PA_MIN (u->smoother_interval * 2, SMOOTHER_MAX_INTERVAL);
+#endif
 }
 
 static int64_t source_get_latency(struct userdata *u) {
     int64_t delay;
-    pa_usec_t now1, now2;
+    pa_usec_t now1;
+#ifndef USE_SMOOTHER_2
+    pa_usec_t now2;
+#endif
 
     pa_assert(u);
 
     now1 = pa_rtclock_now();
+
+#ifdef USE_SMOOTHER_2
+    delay = - pa_smoother_2_get_delay(u->smoother, now1, u->read_count);
+#else
     now2 = pa_smoother_get(u->smoother, now1);
 
     delay = (int64_t) now2 - (int64_t) pa_bytes_to_usec(u->read_count, &u->source->sample_spec);
+#endif
 
     return delay;
 }
@@ -1033,7 +1074,7 @@ static void update_size(struct userdata *u, pa_sample_spec *ss) {
 /* Called from IO context */
 static int unsuspend(struct userdata *u, bool recovering) {
     pa_sample_spec ss;
-    int err;
+    int err, i;
     bool b, d;
     snd_pcm_uframes_t period_frames, buffer_frames;
     snd_pcm_uframes_t tsched_frames = 0;
@@ -1044,12 +1085,25 @@ static int unsuspend(struct userdata *u, bool recovering) {
 
     pa_log_info("Trying resume...");
 
-    if ((err = snd_pcm_open(&u->pcm_handle, u->device_name, SND_PCM_STREAM_CAPTURE,
-                            SND_PCM_NONBLOCK|
-                            SND_PCM_NO_AUTO_RESAMPLE|
-                            SND_PCM_NO_AUTO_CHANNELS|
-                            SND_PCM_NO_AUTO_FORMAT)) < 0) {
-        pa_log("Error opening PCM device %s: %s", u->device_name, pa_alsa_strerror(err));
+    /*
+     * On some machines, during the system suspend and resume, the thread_func could receive
+     * POLLERR events before the dev nodes in /dev/snd/ are accessible, and thread_func calls
+     * the unsuspend() to try to recover the PCM, this will make the snd_pcm_open() fail, here
+     * we add msleep and retry to make sure those nodes are accessible.
+     */
+    for (i = 0; i < 4; i++) {
+	if ((err = snd_pcm_open(&u->pcm_handle, u->device_name, SND_PCM_STREAM_CAPTURE,
+				SND_PCM_NONBLOCK|
+				SND_PCM_NO_AUTO_RESAMPLE|
+				SND_PCM_NO_AUTO_CHANNELS|
+				SND_PCM_NO_AUTO_FORMAT)) < 0 && recovering)
+	    pa_msleep(25);
+	else
+	    break;
+    }
+
+    if (err < 0) {
+	pa_log("Error opening PCM device %s: %s", u->device_name, pa_alsa_strerror(err));
         goto fail;
     }
 
@@ -1352,6 +1406,7 @@ static void source_set_volume_cb(pa_source *s) {
     pa_cvolume r;
     char volume_buf[PA_CVOLUME_SNPRINT_VERBOSE_MAX];
     bool deferred_volume = !!(s->flags & PA_SOURCE_DEFERRED_VOLUME);
+    bool write_to_hw = !deferred_volume;
 
     pa_assert(u);
     pa_assert(u->mixer_path);
@@ -1360,7 +1415,14 @@ static void source_set_volume_cb(pa_source *s) {
     /* Shift up by the base volume */
     pa_sw_cvolume_divide_scalar(&r, &s->real_volume, s->base_volume);
 
-    if (pa_alsa_path_set_volume(u->mixer_path, u->mixer_handle, &s->channel_map, &r, deferred_volume, !deferred_volume) < 0)
+    /* If the set_volume() is called because of ucm active_port changing, the
+     * volume should be written to hw immediately, otherwise this volume will be
+     * overridden by calling get_volume_cb() which is called by
+     * _disdev/_enadev() -> io_mixer_callback() */
+    if (u->ucm_context && s->port_changing)
+	write_to_hw = true;
+
+    if (pa_alsa_path_set_volume(u->mixer_path, u->mixer_handle, &s->channel_map, &r, deferred_volume, write_to_hw) < 0)
         return;
 
     /* Shift down by the base volume, so that 0dB becomes maximum volume */
@@ -1533,7 +1595,7 @@ static int source_set_port_ucm_cb(pa_source *s, pa_device_port *p) {
     else
         sync_mixer(u, p);
 
-    return pa_alsa_ucm_set_port(u->ucm_context, p, false);
+    return pa_alsa_ucm_set_port(u->ucm_context, p);
 }
 
 static int source_set_port_cb(pa_source *s, pa_device_port *p) {
@@ -1575,12 +1637,22 @@ static void source_reconfigure_cb(pa_source *s, pa_sample_spec *spec, bool passt
     int i;
     bool format_supported = false;
     bool rate_supported = false;
+#ifdef USE_SMOOTHER_2
+    pa_sample_spec effective_spec;
+#endif
 
     pa_assert(u);
+
+#ifdef USE_SMOOTHER_2
+    effective_spec.channels = s->sample_spec.channels;
+#endif
 
     for (i = 0; u->supported_formats[i] != PA_SAMPLE_MAX; i++) {
         if (u->supported_formats[i] == spec->format) {
             pa_source_set_sample_format(u->source, spec->format);
+#ifdef USE_SMOOTHER_2
+            effective_spec.format = spec->format;
+#endif
             format_supported = true;
             break;
         }
@@ -1590,11 +1662,17 @@ static void source_reconfigure_cb(pa_source *s, pa_sample_spec *spec, bool passt
         pa_log_info("Source does not support sample format of %s, set it to a verified value",
                     pa_sample_format_to_string(spec->format));
         pa_source_set_sample_format(u->source, u->verified_sample_spec.format);
+#ifdef USE_SMOOTHER_2
+        effective_spec.format = u->verified_sample_spec.format;
+#endif
     }
 
     for (i = 0; u->supported_rates[i]; i++) {
         if (u->supported_rates[i] == spec->rate) {
             pa_source_set_sample_rate(u->source, spec->rate);
+#ifdef USE_SMOOTHER_2
+            effective_spec.rate = spec->rate;
+#endif
             rate_supported = true;
             break;
         }
@@ -1603,7 +1681,15 @@ static void source_reconfigure_cb(pa_source *s, pa_sample_spec *spec, bool passt
     if (!rate_supported) {
         pa_log_info("Source does not support sample rate of %u, set it to a verfied value", spec->rate);
         pa_source_set_sample_rate(u->source, u->verified_sample_spec.rate);
+#ifdef USE_SMOOTHER_2
+        effective_spec.rate = u->verified_sample_spec.rate;
+#endif
     }
+
+#ifdef USE_SMOOTHER_2
+    pa_smoother_2_set_sample_spec(u->smoother, pa_rtclock_now(), &effective_spec);
+#endif
+
 }
 
 static void thread_func(void *userdata) {
@@ -1637,7 +1723,11 @@ static void thread_func(void *userdata) {
                 pa_log_info("Starting capture.");
                 snd_pcm_start(u->pcm_handle);
 
+#ifdef USE_SMOOTHER_2
+                pa_smoother_2_resume(u->smoother, pa_rtclock_now());
+#else
                 pa_smoother_resume(u->smoother, pa_rtclock_now(), true);
+#endif
 
                 u->first = false;
             }
@@ -1665,7 +1755,11 @@ static void thread_func(void *userdata) {
 
                 /* Convert from the sound card time domain to the
                  * system time domain */
+#ifdef USE_SMOOTHER_2
+                cusec = pa_smoother_2_translate(u->smoother, sleep_usec);
+#else
                 cusec = pa_smoother_translate(u->smoother, pa_rtclock_now(), sleep_usec);
+#endif
 
 /*                 pa_log_debug("Waking up in %0.2fms (system clock).", (double) cusec / PA_USEC_PER_MSEC); */
 
@@ -1800,7 +1894,7 @@ static void find_mixer(struct userdata *u, pa_alsa_mapping *mapping, const char 
     u->mixers = pa_hashmap_new_full(pa_idxset_string_hash_func, pa_idxset_string_compare_func,
                                     NULL, (pa_free_cb_t) pa_alsa_mixer_free);
 
-    mdev = pa_proplist_gets(mapping->proplist, "alsa.mixer_device");
+    mdev = mapping ? pa_proplist_gets(mapping->proplist, "alsa.mixer_device") : NULL;
     if (mdev) {
         u->mixer_handle = pa_alsa_open_mixer_by_name(u->mixers, mdev, false);
     } else {
@@ -1849,7 +1943,7 @@ static int setup_mixer(struct userdata *u, bool ignore_dB) {
      * will be NULL, but the UCM device enable sequence will still need to be
      * executed. */
     if (u->source->active_port && u->ucm_context) {
-        if (pa_alsa_ucm_set_port(u->ucm_context, u->source->active_port, false) < 0)
+        if (pa_alsa_ucm_set_port(u->ucm_context, u->source->active_port) < 0)
             return -1;
     }
 
@@ -1959,7 +2053,7 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
     bool volume_is_set;
     bool mute_is_set;
     pa_alsa_profile_set *profile_set = NULL;
-    void *state = NULL;
+    void *state;
 
     pa_assert(m);
     pa_assert(ma);
@@ -2064,6 +2158,7 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
         goto fail;
     }
 
+#ifndef USE_SMOOTHER_2
     u->smoother = pa_smoother_new(
             SMOOTHER_ADJUST_USEC,
             SMOOTHER_WINDOW_USEC,
@@ -2073,6 +2168,7 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
             pa_rtclock_now(),
             true);
     u->smoother_interval = SMOOTHER_MIN_INTERVAL;
+#endif
 
     /* use ucm */
     if (mapping && mapping->ucm_context.ucm)
@@ -2122,7 +2218,7 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
                       &ss, &map,
                       SND_PCM_STREAM_CAPTURE,
                       &period_frames, &buffer_frames, tsched_frames,
-                      &b, &d, mapping)))
+                      &b, &d, &u->supported_formats, &u->supported_rates, mapping)))
             goto fail;
 
     } else if ((dev_id = pa_modargs_get_value(ma, "device_id", NULL))) {
@@ -2136,7 +2232,7 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
                       &ss, &map,
                       SND_PCM_STREAM_CAPTURE,
                       &period_frames, &buffer_frames, tsched_frames,
-                      &b, &d, profile_set, &mapping)))
+                      &b, &d, &u->supported_formats, &u->supported_rates, profile_set, &mapping)))
             goto fail;
 
     } else {
@@ -2147,7 +2243,7 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
                       &ss, &map,
                       SND_PCM_STREAM_CAPTURE,
                       &period_frames, &buffer_frames, tsched_frames,
-                      &b, &d, false)))
+                      &b, &d, &u->supported_formats, &u->supported_rates, false)))
             goto fail;
     }
 
@@ -2183,13 +2279,11 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
 
     u->verified_sample_spec = ss;
 
-    u->supported_formats = pa_alsa_get_supported_formats(u->pcm_handle, ss.format);
     if (!u->supported_formats) {
         pa_log_error("Failed to find any supported sample formats.");
         goto fail;
     }
 
-    u->supported_rates = pa_alsa_get_supported_rates(u->pcm_handle, ss.rate);
     if (!u->supported_rates) {
         pa_log_error("Failed to find any supported sample rates.");
         goto fail;
@@ -2221,7 +2315,7 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
         pa_source_new_data_done(&data);
         goto fail;
     }
-    data.avoid_resampling = avoid_resampling;
+    pa_source_new_data_set_avoid_resampling(&data, avoid_resampling);
 
     pa_source_new_data_set_sample_spec(&data, &ss);
     pa_source_new_data_set_channel_map(&data, &map);
@@ -2237,6 +2331,7 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
         pa_proplist_sets(data.proplist, PA_PROP_DEVICE_PROFILE_NAME, mapping->name);
         pa_proplist_sets(data.proplist, PA_PROP_DEVICE_PROFILE_DESCRIPTION, mapping->description);
 
+        state = NULL;
         while ((key = pa_proplist_iterate(mapping->proplist, &state)))
             pa_proplist_sets(data.proplist, key, pa_proplist_gets(mapping->proplist, key));
     }
@@ -2269,6 +2364,22 @@ pa_source *pa_alsa_source_new(pa_module *m, pa_modargs *ma, const char*driver, p
     if (!u->source) {
         pa_log("Failed to create source object");
         goto fail;
+    }
+
+#ifdef USE_SMOOTHER_2
+    u->smoother = pa_smoother_2_new(SMOOTHER_WINDOW_USEC, pa_rtclock_now(), frame_size, u->source->sample_spec.rate);
+#endif
+
+    if (u->ucm_context) {
+        pa_device_port *port;
+        unsigned h_prio = 0;
+        PA_HASHMAP_FOREACH(port, u->source->ports, state) {
+            if (!h_prio || port->priority > h_prio)
+                h_prio = port->priority;
+        }
+        /* ucm ports prioriy is 100, 200, ..., 900, change it to units digit */
+        h_prio = h_prio / 100;
+        u->source->priority += h_prio;
     }
 
     if (pa_modargs_get_value_u32(ma, "deferred_volume_safety_margin",
@@ -2420,7 +2531,11 @@ static void userdata_free(struct userdata *u) {
         pa_hashmap_free(u->mixers);
 
     if (u->smoother)
+#ifdef USE_SMOOTHER_2
+        pa_smoother_2_free(u->smoother);
+#else
         pa_smoother_free(u->smoother);
+#endif
 
     if (u->supported_formats)
         pa_xfree(u->supported_formats);

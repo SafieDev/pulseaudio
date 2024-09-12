@@ -29,6 +29,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
+#ifdef HAVE_NETDB_H
+#include <netdb.h>
+#endif
 
 #include <pulse/rtclock.h>
 #include <pulse/timeval.h>
@@ -285,6 +288,7 @@ static int rtpoll_work_cb(pa_rtpoll_item *i) {
         pa_log_debug("wi=%lu ri=%lu", (unsigned long) wi, (unsigned long) ri);
 
         sink_delay = pa_sink_get_latency_within_thread(s->sink_input->sink, false);
+        sink_delay += pa_resampler_get_delay_usec(s->sink_input->thread_info.resampler);
         render_delay = pa_bytes_to_usec(pa_memblockq_get_length(s->sink_input->thread_info.render_memblockq), &s->sink_input->sink->sample_spec);
 
         if (ri > render_delay+sink_delay)
@@ -568,7 +572,7 @@ static struct session *session_new(struct userdata *u, const pa_sdp_info *sdp_in
 
     pa_memblock_unref(silence.memblock);
 
-    if (!(s->rtp_context = pa_rtp_context_new_recv(fd, sdp_info->payload, &s->sdp_info.sample_spec)))
+    if (!(s->rtp_context = pa_rtp_context_new_recv(fd, sdp_info->payload, &s->sdp_info.sample_spec, sdp_info->enable_opus)))
         goto fail;
 
     pa_hashmap_put(s->userdata->by_origin, s->sdp_info.origin, s);
@@ -676,9 +680,13 @@ static void check_death_event_cb(pa_mainloop_api *m, pa_time_event *t, const str
 int pa__init(pa_module*m) {
     struct userdata *u;
     pa_modargs *ma = NULL;
+#if defined(HAVE_GETADDRINFO)
+    struct addrinfo *sap_addrinfo = NULL;
+#else
     struct sockaddr_in sa4;
 #ifdef HAVE_IPV6
     struct sockaddr_in6 sa6;
+#endif
 #endif
     struct sockaddr *sa;
     socklen_t salen;
@@ -695,6 +703,27 @@ int pa__init(pa_module*m) {
 
     sap_address = pa_modargs_get_value(ma, "sap_address", DEFAULT_SAP_ADDRESS);
 
+#if defined(HAVE_GETADDRINFO)
+    {
+        struct addrinfo hints;
+        char *service;
+
+        pa_zero(hints);
+
+        service = pa_sprintf_malloc("%d", SAP_PORT);
+
+        hints.ai_flags = AI_NUMERICHOST;
+        if (getaddrinfo(sap_address, service, &hints, &sap_addrinfo) != 0) {
+            pa_xfree(service);
+            pa_log("Invalid SAP address '%s'", sap_address);
+            goto fail;
+        }
+        pa_xfree(service);
+
+        sa = sap_addrinfo->ai_addr;
+        salen = sap_addrinfo->ai_addrlen;
+    }
+#else
     if (inet_pton(AF_INET, sap_address, &sa4.sin_addr) > 0) {
         sa4.sin_family = AF_INET;
         sa4.sin_port = htons(SAP_PORT);
@@ -711,6 +740,7 @@ int pa__init(pa_module*m) {
         pa_log("Invalid SAP address '%s'", sap_address);
         goto fail;
     }
+#endif
 
     latency_msec = DEFAULT_LATENCY_MSEC;
     if (pa_modargs_get_value_u32(ma, "latency_msec", &latency_msec) < 0 || latency_msec < 1 || latency_msec > 300000) {
@@ -738,9 +768,18 @@ int pa__init(pa_module*m) {
 
     pa_modargs_free(ma);
 
+#if defined(HAVE_GETADDRINFO)
+    freeaddrinfo(sap_addrinfo);
+#endif
+
     return 0;
 
 fail:
+#if defined(HAVE_GETADDRINFO)
+    if (sap_addrinfo)
+        freeaddrinfo(sap_addrinfo);
+#endif
+
     if (ma)
         pa_modargs_free(ma);
 

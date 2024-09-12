@@ -36,7 +36,7 @@
 
 #include "channelmap.h"
 
-const char *const table[PA_CHANNEL_POSITION_MAX] = {
+static const char *const table[PA_CHANNEL_POSITION_MAX] = {
     [PA_CHANNEL_POSITION_MONO] = "mono",
 
     [PA_CHANNEL_POSITION_FRONT_CENTER] = "front-center",
@@ -99,7 +99,7 @@ const char *const table[PA_CHANNEL_POSITION_MAX] = {
     [PA_CHANNEL_POSITION_TOP_REAR_RIGHT] = "top-rear-right"
 };
 
-const char *const pretty_table[PA_CHANNEL_POSITION_MAX] = {
+static const char *const pretty_table[PA_CHANNEL_POSITION_MAX] = {
     [PA_CHANNEL_POSITION_MONO] = N_("Mono"),
 
     [PA_CHANNEL_POSITION_FRONT_CENTER] = N_("Front Center"),
@@ -296,8 +296,7 @@ pa_channel_map* pa_channel_map_init_auto(pa_channel_map *m, unsigned channels, p
 
         case PA_CHANNEL_MAP_WAVEEX:
 
-            /* Following http://www.microsoft.com/whdc/device/audio/multichaud.mspx#EKLAC */
-
+            /* following: https://docs.microsoft.com/en-us/previous-versions/windows/hardware/design/dn653308(v=vs.85) */
             switch (channels) {
                 case 1:
                     m->map[0] = PA_CHANNEL_POSITION_MONO;

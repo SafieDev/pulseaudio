@@ -14,7 +14,6 @@ daemon.conf
 default.pa
 echo-cancel-test
 esdcompat
-gconf-helper
 gsettings-helper
 org.freedesktop.pulseaudio.gschema.valid
 pacat
@@ -26,6 +25,7 @@ pasuspender
 pax11publish
 pulseaudio
 pulseaudio.service
+pulseaudio-x11.service
 start-pulseaudio-x11
 *-orc-gen.[ch]
 # tests
@@ -49,6 +49,7 @@ flist-test
 format-test
 get-binary-name-test
 gtk-test
+hashmap-test
 hook-list-test
 interpol-test
 ipacl-test
@@ -70,6 +71,7 @@ proplist-test
 queue-test
 remix-test
 resampler-test
+resampler-rewind-test
 rtpoll-test
 rtstutter
 sig2str-test

@@ -528,6 +528,8 @@ static bool legacy_entry_read(struct userdata *u, pa_datum *data, struct entry *
         char port[PA_NAME_MAX];
     } PA_GCC_PACKED;
     struct legacy_entry *le;
+    pa_channel_map channel_map;
+    pa_cvolume volume;
 
     pa_assert(u);
     pa_assert(data);
@@ -551,12 +553,17 @@ static bool legacy_entry_read(struct userdata *u, pa_datum *data, struct entry *
         return false;
     }
 
-    if (le->volume_valid && !pa_channel_map_valid(&le->channel_map)) {
+    /* Read these out before accessing contents via pointers as struct legacy_entry may not be adequately aligned for these
+     * members to be accessed directly */
+    channel_map = le->channel_map;
+    volume = le->volume;
+
+    if (le->volume_valid && !pa_channel_map_valid(&channel_map)) {
         pa_log_warn("Invalid channel map.");
         return false;
     }
 
-    if (le->volume_valid && (!pa_cvolume_valid(&le->volume) || !pa_cvolume_compatible_with_channel_map(&le->volume, &le->channel_map))) {
+    if (le->volume_valid && (!pa_cvolume_valid(&volume) || !pa_cvolume_compatible_with_channel_map(&volume, &channel_map))) {
         pa_log_warn("Volume and channel map don't match.");
         return false;
     }
@@ -732,7 +739,7 @@ static pa_hook_result_t sink_new_hook_callback(pa_core *c, pa_sink_new_data *new
 
         if (e->port_valid) {
             if (!new_data->active_port) {
-                pa_log_info("Restoring port for sink %s.", name);
+                pa_log_info("Restoring port '%s' for sink %s.", pa_strnull(e->port), name);
                 pa_sink_new_data_set_port(new_data, e->port);
                 new_data->save_port = true;
             } else
@@ -874,7 +881,7 @@ static pa_hook_result_t source_new_hook_callback(pa_core *c, pa_source_new_data 
 
         if (e->port_valid) {
             if (!new_data->active_port) {
-                pa_log_info("Restoring port for source %s.", name);
+                pa_log_info("Restoring port '%s' for source %s.", pa_strnull(e->port), name);
                 pa_source_new_data_set_port(new_data, e->port);
                 new_data->save_port = true;
             } else
@@ -1195,7 +1202,7 @@ static pa_hook_result_t connection_unlink_hook_cb(pa_native_protocol *p, pa_nati
 int pa__init(pa_module*m) {
     pa_modargs *ma = NULL;
     struct userdata *u;
-    char *fname;
+    char *state_path;
     pa_sink *sink;
     pa_source *source;
     uint32_t idx;
@@ -1252,17 +1259,15 @@ int pa__init(pa_module*m) {
     if (restore_formats)
         pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SINK_PUT], PA_HOOK_EARLY, (pa_hook_cb_t) sink_put_hook_callback, u);
 
-    if (!(fname = pa_state_path("device-volumes", true)))
+    if (!(state_path = pa_state_path(NULL, true)))
         goto fail;
 
-    if (!(u->database = pa_database_open(fname, true))) {
-        pa_log("Failed to open volume database '%s': %s", fname, pa_cstrerror(errno));
-        pa_xfree(fname);
+    if (!(u->database = pa_database_open(state_path, "device-volumes", true, true))) {
+        pa_xfree(state_path);
         goto fail;
     }
 
-    pa_log_info("Successfully opened database file '%s'.", fname);
-    pa_xfree(fname);
+    pa_xfree(state_path);
 
     PA_IDXSET_FOREACH(sink, m->core->sinks, idx)
         subscribe_callback(m->core, PA_SUBSCRIPTION_EVENT_SINK|PA_SUBSCRIPTION_EVENT_NEW, sink->index, u);

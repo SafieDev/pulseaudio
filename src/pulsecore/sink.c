@@ -40,6 +40,7 @@
 #include <pulsecore/namereg.h>
 #include <pulsecore/core-util.h>
 #include <pulsecore/sample-util.h>
+#include <pulsecore/stream-util.h>
 #include <pulsecore/mix.h>
 #include <pulsecore/core-subscribe.h>
 #include <pulsecore/log.h>
@@ -111,6 +112,13 @@ void pa_sink_new_data_set_alternate_sample_rate(pa_sink_new_data *data, const ui
 
     data->alternate_sample_rate_is_set = true;
     data->alternate_sample_rate = alternate_sample_rate;
+}
+
+void pa_sink_new_data_set_avoid_resampling(pa_sink_new_data *data, bool avoid_resampling) {
+    pa_assert(data);
+
+    data->avoid_resampling_is_set = true;
+    data->avoid_resampling = avoid_resampling;
 }
 
 void pa_sink_new_data_set_volume(pa_sink_new_data *data, const pa_cvolume *volume) {
@@ -271,7 +279,10 @@ pa_sink* pa_sink_new(
     else
         s->alternate_sample_rate = s->core->alternate_sample_rate;
 
-    s->avoid_resampling = data->avoid_resampling;
+    if (data->avoid_resampling_is_set)
+        s->avoid_resampling = data->avoid_resampling;
+    else
+        s->avoid_resampling = s->core->avoid_resampling;
 
     s->inputs = pa_idxset_new(NULL, NULL);
     s->n_corked = 0;
@@ -328,6 +339,7 @@ pa_sink* pa_sink_new(
     s->thread_info.soft_muted = s->muted;
     s->thread_info.state = s->state;
     s->thread_info.rewind_nbytes = 0;
+    s->thread_info.last_rewind_nbytes = 0;
     s->thread_info.rewind_requested = false;
     s->thread_info.max_rewind = 0;
     s->thread_info.max_request = 0;
@@ -363,11 +375,11 @@ pa_sink* pa_sink_new(
     pa_source_new_data_set_sample_spec(&source_data, &s->sample_spec);
     pa_source_new_data_set_channel_map(&source_data, &s->channel_map);
     pa_source_new_data_set_alternate_sample_rate(&source_data, s->alternate_sample_rate);
+    pa_source_new_data_set_avoid_resampling(&source_data, s->avoid_resampling);
     source_data.name = pa_sprintf_malloc("%s.monitor", name);
     source_data.driver = data->driver;
     source_data.module = data->module;
     source_data.card = data->card;
-    source_data.avoid_resampling = data->avoid_resampling;
 
     dn = pa_proplist_gets(s->proplist, PA_PROP_DEVICE_DESCRIPTION);
     pa_proplist_setf(source_data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Monitor of %s", dn ? dn : s->name);
@@ -694,8 +706,8 @@ void pa_sink_put(pa_sink* s) {
         pa_cvolume_remap(&s->real_volume, &root_sink->channel_map, &s->channel_map);
     } else
         /* We assume that if the sink implementor changed the default
-         * volume he did so in real_volume, because that is the usual
-         * place where he is supposed to place his changes.  */
+         * volume they did so in real_volume, because that is the usual
+         * place where they are supposed to place their changes.  */
         s->reference_volume = s->real_volume;
 
     s->thread_info.soft_volume = s->soft_volume;
@@ -774,6 +786,10 @@ void pa_sink_unlink(pa_sink* s) {
         j = i;
     }
 
+    /* Unlink monitor source before unlinking the sink */
+    if (s->monitor_source)
+        pa_source_unlink(s->monitor_source);
+
     if (linked)
         /* It's important to keep the suspend cause unchanged when unlinking,
          * because if we remove the SESSION suspend cause here, the alsa sink
@@ -784,9 +800,6 @@ void pa_sink_unlink(pa_sink* s) {
         s->state = PA_SINK_UNLINKED;
 
     reset_callbacks(s);
-
-    if (s->monitor_source)
-        pa_source_unlink(s->monitor_source);
 
     if (linked) {
         pa_subscription_post(s->core, PA_SUBSCRIPTION_EVENT_SINK | PA_SUBSCRIPTION_EVENT_REMOVE, s->index);
@@ -1003,20 +1016,29 @@ size_t pa_sink_process_input_underruns(pa_sink *s, size_t left_to_play) {
         if (i->origin_sink) {
             size_t filter_result, left_to_play_origin;
 
-            /* The recursive call works in the origin sink domain ... */
-            left_to_play_origin = pa_convert_size(left_to_play, &i->sink->sample_spec, &i->origin_sink->sample_spec);
+            /* The combine sink sets i->origin sink but has a different threading model
+             * than the filter sinks. Therefore the recursion below may not be executed
+             * because pa_sink_process_input_underruns() was not called in the thread
+             * context of the origin sink.
+             * FIXME: It is unclear if some other kind of recursion would be necessary
+             * for the combine sink. */
+            if (!i->module || !pa_safe_streq(i->module->name, "module-combine-sink")) {
 
-            /* .. and returns the time to sleep before waking up. We need the
-             * underrun duration for comparisons, so we undo the subtraction on
-             * the return value... */
-            filter_result = left_to_play_origin - pa_sink_process_input_underruns(i->origin_sink, left_to_play_origin);
+                /* The recursive call works in the origin sink domain ... */
+                left_to_play_origin = pa_convert_size(left_to_play, &i->sink->sample_spec, &i->origin_sink->sample_spec);
 
-            /* ... and convert it back to the master sink domain */
-            filter_result = pa_convert_size(filter_result, &i->origin_sink->sample_spec, &i->sink->sample_spec);
+                /* .. and returns the time to sleep before waking up. We need the
+                 * underrun duration for comparisons, so we undo the subtraction on
+                 * the return value... */
+                filter_result = left_to_play_origin - pa_sink_process_input_underruns(i->origin_sink, left_to_play_origin);
 
-            /* Remember the longest underrun so far */
-            if (filter_result > result)
-                result = filter_result;
+                /* ... and convert it back to the master sink domain */
+                filter_result = pa_convert_size(filter_result, &i->origin_sink->sample_spec, &i->sink->sample_spec);
+
+                /* Remember the longest underrun so far */
+                if (filter_result > result)
+                    result = filter_result;
+            }
         }
 
         if (uf == 0) {
@@ -1061,6 +1083,9 @@ void pa_sink_process_rewind(pa_sink *s, size_t nbytes) {
         if (s->flags & PA_SINK_DEFERRED_VOLUME)
             pa_sink_volume_change_rewind(s, nbytes);
     }
+
+    /* Save rewind value */
+    s->thread_info.last_rewind_nbytes = nbytes;
 
     PA_HASHMAP_FOREACH(i, s->thread_info.inputs, state) {
         pa_sink_input_assert_ref(i);
@@ -1546,10 +1571,23 @@ void pa_sink_reconfigure(pa_sink *s, pa_sample_spec *spec, bool passthrough) {
 
     PA_IDXSET_FOREACH(i, s->inputs, idx) {
         if (i->state == PA_SINK_INPUT_CORKED)
-            pa_sink_input_update_resampler(i);
+            pa_sink_input_update_resampler(i, true);
     }
 
     pa_sink_suspend(s, false, PA_SUSPEND_INTERNAL);
+}
+
+/* Called from main thread */
+size_t pa_sink_get_last_rewind(pa_sink *s) {
+    size_t rewind_bytes;
+
+    pa_sink_assert_ref(s);
+    pa_assert_ctl_context();
+    pa_assert(PA_SINK_IS_LINKED(s->state));
+
+    pa_assert_se(pa_asyncmsgq_send(s->asyncmsgq, PA_MSGOBJECT(s), PA_SINK_MESSAGE_GET_LAST_REWIND, &rewind_bytes, 0, NULL) == 0);
+
+    return rewind_bytes;
 }
 
 /* Called from main thread */
@@ -1626,6 +1664,27 @@ bool pa_sink_flat_volume_enabled(pa_sink *s) {
         return (s->flags & PA_SINK_FLAT_VOLUME);
     else
         return false;
+}
+
+/* Check if the sink has a virtual sink attached.
+ * Called from the IO thread. */
+bool pa_sink_has_filter_attached(pa_sink *s) {
+    bool vsink_attached = false;
+    void *state = NULL;
+    pa_sink_input *i;
+
+    pa_assert(s);
+
+    if (PA_SINK_IS_LINKED(s->thread_info.state)) {
+        PA_HASHMAP_FOREACH(i, s->thread_info.inputs, state) {
+            if (!i->origin_sink)
+                continue;
+
+            vsink_attached = true;
+            break;
+        }
+    }
+    return vsink_attached;
 }
 
 /* Called from the main thread (and also from the IO thread while the main
@@ -2544,6 +2603,40 @@ static void set_shared_volume_within_thread(pa_sink *s) {
     }
 }
 
+/* Called from IO thread. Gets max_rewind limit from sink inputs.
+ * This function is used to communicate the max_rewind value of a
+ * virtual sink to the master sink. The get_max_rewind_limit()
+ * callback is implemented by sink inputs connecting a virtual
+ * sink to its master. */
+static size_t get_max_rewind_limit(pa_sink *s, size_t requested_limit) {
+    pa_sink_input *i;
+    void *state = NULL;
+    size_t rewind_limit;
+
+    pa_assert(s);
+
+    /* Get rewind limit in sink sample spec from sink inputs */
+    rewind_limit = (size_t)(-1);
+    if (PA_SINK_IS_LINKED(s->thread_info.state)) {
+        PA_HASHMAP_FOREACH(i, s->thread_info.inputs, state) {
+
+            if (i->get_max_rewind_limit) {
+                size_t limit;
+
+                limit = i->get_max_rewind_limit(i);
+                if (rewind_limit == (size_t)(-1) || rewind_limit > limit)
+                    rewind_limit = limit;
+            }
+        }
+    }
+
+    /* Set max_rewind */
+    if (rewind_limit != (size_t)(-1))
+        requested_limit = PA_MIN(rewind_limit, requested_limit);
+
+    return requested_limit;
+}
+
 /* Called from IO thread, except when it is not */
 int pa_sink_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offset, pa_memchunk *chunk) {
     pa_sink *s = PA_SINK(o);
@@ -2640,8 +2733,8 @@ int pa_sink_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offse
             }
 
             pa_hashmap_remove_and_free(s->thread_info.inputs, PA_UINT32_TO_PTR(i->index));
-            pa_sink_invalidate_requested_latency(s, true);
             pa_sink_request_rewind(s, (size_t) -1);
+            pa_sink_invalidate_requested_latency(s, true);
 
             /* In flat volume mode we need to update the volume as
              * well */
@@ -2658,59 +2751,21 @@ int pa_sink_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offse
             pa_assert(!i->thread_info.sync_prev);
 
             if (i->thread_info.state != PA_SINK_INPUT_CORKED) {
-                pa_usec_t usec = 0;
-                size_t sink_nbytes, total_nbytes;
 
                 /* The old sink probably has some audio from this
                  * stream in its buffer. We want to "take it back" as
                  * much as possible and play it to the new sink. We
                  * don't know at this point how much the old sink can
-                 * rewind. We have to pick something, and that
-                 * something is the full latency of the old sink here.
-                 * So we rewind the stream buffer by the sink latency
-                 * amount, which may be more than what we should
-                 * rewind. This can result in a chunk of audio being
-                 * played both to the old sink and the new sink.
-                 *
-                 * FIXME: Fix this code so that we don't have to make
-                 * guesses about how much the sink will actually be
-                 * able to rewind. If someone comes up with a solution
-                 * for this, something to note is that the part of the
-                 * latency that the old sink couldn't rewind should
-                 * ideally be compensated after the stream has moved
-                 * to the new sink by adding silence. The new sink
-                 * most likely can't start playing the moved stream
-                 * immediately, and that gap should be removed from
-                 * the "compensation silence" (at least at the time of
-                 * writing this, the move finish code will actually
-                 * already take care of dropping the new sink's
-                 * unrewindable latency, so taking into account the
-                 * unrewindable latency of the old sink is the only
-                 * problem).
-                 *
-                 * The render_memblockq contents are discarded,
-                 * because when the sink changes, the format of the
-                 * audio stored in the render_memblockq may change
-                 * too, making the stored audio invalid. FIXME:
-                 * However, the read and write indices are moved back
-                 * the same amount, so if they are not the same now,
-                 * they won't be the same after the rewind either. If
-                 * the write index of the render_memblockq is ahead of
-                 * the read index, then the render_memblockq will feed
-                 * the new sink some silence first, which it shouldn't
-                 * do. The write index should be flushed to be the
-                 * same as the read index. */
+                 * rewind, so we just save some values and reconstruct
+                 * the render memblockq in finish_move(). */
 
-                /* Get the latency of the sink */
-                usec = pa_sink_get_latency_within_thread(s, false);
-                sink_nbytes = pa_usec_to_bytes(usec, &s->sample_spec);
-                total_nbytes = sink_nbytes + pa_memblockq_get_length(i->thread_info.render_memblockq);
-
-                if (total_nbytes > 0) {
-                    i->thread_info.rewrite_nbytes = i->thread_info.resampler ? pa_resampler_request(i->thread_info.resampler, total_nbytes) : total_nbytes;
-                    i->thread_info.rewrite_flush = true;
-                    pa_sink_input_process_rewind(i, sink_nbytes);
-                }
+                /* Save some current values for restore_render_memblockq() */
+                i->thread_info.origin_sink_latency = pa_sink_get_latency_within_thread(s, false);
+                i->thread_info.move_start_time = pa_rtclock_now();
+                i->thread_info.resampler_delay_frames = 0;
+                if (i->thread_info.resampler)
+                    /* Round down */
+                    i->thread_info.resampler_delay_frames = pa_resampler_get_delay(i->thread_info.resampler, false);
             }
 
             pa_sink_input_detach(i);
@@ -2718,10 +2773,12 @@ int pa_sink_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offse
             /* Let's remove the sink input ...*/
             pa_hashmap_remove_and_free(s->thread_info.inputs, PA_UINT32_TO_PTR(i->index));
 
-            pa_sink_invalidate_requested_latency(s, true);
-
+            /* The rewind must be requested before invalidating the latency, otherwise
+             * the max_rewind value of the sink may change before the rewind. */
             pa_log_debug("Requesting rewind due to started move");
             pa_sink_request_rewind(s, (size_t) -1);
+
+            pa_sink_invalidate_requested_latency(s, true);
 
             /* In flat volume mode we need to update the volume as
              * well */
@@ -2743,7 +2800,7 @@ int pa_sink_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offse
 
             if (i->thread_info.state != PA_SINK_INPUT_CORKED) {
                 pa_usec_t usec = 0;
-                size_t nbytes;
+                size_t nbytes, delay_bytes;
 
                 /* In the ideal case the new sink would start playing
                  * the stream immediately. That requires the sink to
@@ -2767,8 +2824,20 @@ int pa_sink_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offse
                 usec = pa_sink_get_latency_within_thread(s, false);
                 nbytes = pa_usec_to_bytes(usec, &s->sample_spec);
 
-                if (nbytes > 0)
-                    pa_sink_input_drop(i, nbytes);
+                /* Calculate number of samples that have been played during the move */
+                delay_bytes = 0;
+                if (i->thread_info.move_start_time > 0) {
+                    usec = pa_rtclock_now() - i->thread_info.move_start_time;
+                    pa_log_debug("Move took %lu usec", usec);
+                    delay_bytes = pa_usec_to_bytes(usec, &s->sample_spec);
+                }
+
+                /* max_rewind must be updated for the sink input because otherwise
+                 * the data in the render memblockq will get lost */
+                pa_sink_input_update_max_rewind(i, nbytes);
+
+                if (nbytes + delay_bytes > 0)
+                    pa_sink_input_drop(i, nbytes + delay_bytes);
 
                 pa_log_debug("Requesting rewind due to finished move");
                 pa_sink_request_rewind(s, nbytes);
@@ -2784,6 +2853,11 @@ int pa_sink_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offse
 
             pa_sink_input_update_max_rewind(i, s->thread_info.max_rewind);
             pa_sink_input_update_max_request(i, s->thread_info.max_request);
+
+            /* Reset move variables */
+            i->thread_info.move_start_time = 0;
+            i->thread_info.resampler_delay_frames = 0;
+            i->thread_info.origin_sink_latency = 0;
 
             return o->process_msg(o, PA_SINK_MESSAGE_SET_SHARED_VOLUME, NULL, 0, NULL);
         }
@@ -2929,6 +3003,11 @@ int pa_sink_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offse
         case PA_SINK_MESSAGE_GET_MAX_REWIND:
 
             *((size_t*) userdata) = s->thread_info.max_rewind;
+            return 0;
+
+        case PA_SINK_MESSAGE_GET_LAST_REWIND:
+
+            *((size_t*) userdata) = s->thread_info.last_rewind_nbytes;
             return 0;
 
         case PA_SINK_MESSAGE_GET_MAX_REQUEST:
@@ -3106,6 +3185,8 @@ void pa_sink_set_max_rewind_within_thread(pa_sink *s, size_t max_rewind) {
 
     pa_sink_assert_ref(s);
     pa_sink_assert_io_context(s);
+
+    max_rewind = get_max_rewind_limit(s, max_rewind);
 
     if (max_rewind == s->thread_info.max_rewind)
         return;
@@ -3420,6 +3501,8 @@ int pa_sink_set_port(pa_sink *s, const char *name, bool save) {
         return 0;
     }
 
+    s->port_changing = true;
+
     if (s->set_port(s, port) < 0)
         return -PA_ERR_NOENTITY;
 
@@ -3436,6 +3519,8 @@ int pa_sink_set_port(pa_sink *s, const char *name, bool save) {
     pa_core_update_default_sink(s->core);
 
     pa_hook_fire(&s->core->hooks[PA_CORE_HOOK_SINK_PORT_CHANGED], s);
+
+    s->port_changing = false;
 
     return 0;
 }
@@ -3567,6 +3652,14 @@ unsigned pa_device_init_priority(pa_proplist *p) {
 
     pa_assert(p);
 
+    /* JACK sinks and sources get very high priority so that we'll switch the
+     * default devices automatically when jackd starts and
+     * module-jackdbus-detect creates the jack sink and source. */
+    if ((s = pa_proplist_gets(p, PA_PROP_DEVICE_API))) {
+        if (pa_streq(s, "jack"))
+            priority += 10000;
+    }
+
     if ((s = pa_proplist_gets(p, PA_PROP_DEVICE_CLASS))) {
 
         if (pa_streq(s, "sound"))
@@ -3599,10 +3692,18 @@ unsigned pa_device_init_priority(pa_proplist *p) {
 
     if ((s = pa_proplist_gets(p, PA_PROP_DEVICE_PROFILE_NAME))) {
 
-        if (pa_startswith(s, "analog-"))
+        if (pa_startswith(s, "analog-")) {
             priority += 9;
+
+            /* If an analog device has an intended role of "phone", it probably
+             * co-exists with another device that is meant for everything else,
+             * and that other device should have higher priority than the phone
+             * device. */
+            if (pa_str_in_list_spaces(pa_proplist_gets(p, PA_PROP_DEVICE_INTENDED_ROLES), "phone"))
+                priority -= 1;
+        }
         else if (pa_startswith(s, "iec958-"))
-            priority += 8;
+            priority += 7;
     }
 
     return priority;
@@ -3961,6 +4062,10 @@ void pa_sink_move_streams_to_default_sink(pa_core *core, pa_sink *old_sink, bool
             continue;
 
         if (!i->sink)
+            continue;
+
+        /* Don't move sink-inputs which connect filter sinks to their target sinks */
+        if (i->origin_sink)
             continue;
 
         /* If default_sink_changed is false, the old sink became unavailable, so all streams must be moved. */

@@ -26,6 +26,9 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <unistd.h>
+#ifdef HAVE_NETDB_H
+#include <netdb.h>
+#endif
 
 #include <pulse/rtclock.h>
 #include <pulse/timeval.h>
@@ -67,6 +70,7 @@ PA_MODULE_USAGE(
         "ttl=<ttl value> "
         "inhibit_auto_suspend=<always|never|only_with_non_monitor_sources>"
         "stream_name=<name of the stream>"
+        "enable_opus=<enable OPUS codec>"
 );
 
 #define DEFAULT_PORT 46000
@@ -92,6 +96,7 @@ static const char* const valid_modargs[] = {
     "ttl",
     "inhibit_auto_suspend",
     "stream_name",
+    "enable_opus",
     NULL
 };
 
@@ -228,6 +233,7 @@ int pa__init(pa_module*m) {
     socklen_t k;
     char hn[128], *n;
     bool loop = false;
+    bool enable_opus = false;
     enum inhibit_auto_suspend inhibit_auto_suspend = INHIBIT_AUTO_SUSPEND_ONLY_WITH_NON_MONITOR_SOURCES;
     const char *inhibit_auto_suspend_str;
     pa_source_output_new_data data;
@@ -249,6 +255,11 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
+    if (pa_modargs_get_value_boolean(ma, "enable_opus", &enable_opus) < 0) {
+        pa_log("Failed to parse \"use_opus\" parameter.");
+        goto fail;
+    }
+
     if ((inhibit_auto_suspend_str = pa_modargs_get_value(ma, "inhibit_auto_suspend", NULL))) {
         if (pa_streq(inhibit_auto_suspend_str, "always"))
             inhibit_auto_suspend = INHIBIT_AUTO_SUSPEND_ALWAYS;
@@ -263,7 +274,7 @@ int pa__init(pa_module*m) {
     }
 
     ss = s->sample_spec;
-    pa_rtp_sample_spec_fixup(&ss);
+    pa_rtp_sample_spec_fixup(&ss, enable_opus);
     cm = s->channel_map;
     if (pa_modargs_get_sample_spec(ma, &ss) < 0) {
         pa_log("Failed to parse sample specification");
@@ -273,6 +284,11 @@ int pa__init(pa_module*m) {
     if (!pa_rtp_sample_spec_valid(&ss)) {
         pa_log("Specified sample type not compatible with RTP");
         goto fail;
+    }
+
+    if (enable_opus && ss.rate != 48000) {
+        pa_log_warn("OPUS requires sample rate as 48 KHz. Setting rate=48000.");
+        ss.rate = 48000;
     }
 
     if (ss.channels != cm.channels)
@@ -303,6 +319,42 @@ int pa__init(pa_module*m) {
 
     src_addr = pa_modargs_get_value(ma, "source_ip", DEFAULT_SOURCE_IP);
 
+#if defined(HAVE_GETADDRINFO)
+    {
+        struct addrinfo *src_addrinfo = NULL;
+        struct addrinfo hints;
+
+        pa_zero(hints);
+
+        hints.ai_flags = AI_NUMERICHOST;
+        if (getaddrinfo(src_addr, NULL, &hints, &src_addrinfo) != 0) {
+            pa_log("Invalid source '%s'", src_addr);
+            goto fail;
+        }
+
+        af = src_addrinfo->ai_family;
+        if (af == AF_INET) {
+            memcpy(&src_sa4, src_addrinfo->ai_addr, src_addrinfo->ai_addrlen);
+            src_sa4.sin_port = htons(0);
+            src_sap_sa4 = src_sa4;
+        }
+#ifdef HAVE_IPV6
+        else if (af == AF_INET6) {
+            memcpy(&src_sa6, src_addrinfo->ai_addr, src_addrinfo->ai_addrlen);
+            src_sa6.sin6_port = htons(0);
+            src_sap_sa6 = src_sa6;
+        }
+#endif
+        else
+        {
+            freeaddrinfo(src_addrinfo);
+            pa_log("Invalid source '%s'", src_addr);
+            goto fail;
+        }
+
+        freeaddrinfo(src_addrinfo);
+    }
+#else
     if (inet_pton(AF_INET, src_addr, &src_sa4.sin_addr) > 0) {
         src_sa4.sin_family = af = AF_INET;
         src_sa4.sin_port = htons(0);
@@ -320,11 +372,50 @@ int pa__init(pa_module*m) {
         pa_log("Invalid source address '%s'", src_addr);
         goto fail;
     }
+#endif /* HAVE_GETADDRINFO */
 
     dst_addr = pa_modargs_get_value(ma, "destination", NULL);
     if (dst_addr == NULL)
         dst_addr = pa_modargs_get_value(ma, "destination_ip", DEFAULT_DESTINATION_IP);
 
+#if defined(HAVE_GETADDRINFO)
+    {
+        struct addrinfo *dst_addrinfo = NULL;
+        struct addrinfo hints;
+
+        pa_zero(hints);
+
+        hints.ai_flags = AI_NUMERICHOST;
+        if (getaddrinfo(dst_addr, NULL, &hints, &dst_addrinfo) != 0) {
+            pa_log("Invalid destination '%s'", dst_addr);
+            goto fail;
+        }
+
+        af = dst_addrinfo->ai_family;
+        if (af == AF_INET) {
+            memcpy(&dst_sa4, dst_addrinfo->ai_addr, dst_addrinfo->ai_addrlen);
+            dst_sa4.sin_port = htons((uint16_t) port);
+            dst_sap_sa4 = dst_sa4;
+            dst_sap_sa4.sin_port = htons(SAP_PORT);
+        }
+#ifdef HAVE_IPV6
+        else if (af == AF_INET6) {
+            memcpy(&dst_sa6, dst_addrinfo->ai_addr, dst_addrinfo->ai_addrlen);
+            dst_sa6.sin6_port = htons((uint16_t) port);
+            dst_sap_sa6 = dst_sa6;
+            dst_sap_sa6.sin6_port = htons(SAP_PORT);
+        }
+#endif
+        else
+        {
+            freeaddrinfo(dst_addrinfo);
+            pa_log("Invalid destination '%s'", dst_addr);
+            goto fail;
+        }
+
+        freeaddrinfo(dst_addrinfo);
+    }
+#else
     if (inet_pton(AF_INET, dst_addr, &dst_sa4.sin_addr) > 0) {
         dst_sa4.sin_family = af = AF_INET;
         dst_sa4.sin_port = htons((uint16_t) port);
@@ -344,6 +435,7 @@ int pa__init(pa_module*m) {
         pa_log("Invalid destination '%s'", dst_addr);
         goto fail;
     }
+#endif /* HAVE_GETADDRINFO */
 
     if ((fd = pa_socket_cloexec(af, SOCK_DGRAM, 0)) < 0) {
         pa_log("socket() failed: %s", pa_cstrerror(errno));
@@ -476,19 +568,19 @@ int pa__init(pa_module*m) {
         p = pa_sdp_build(af,
                      (void*) &((struct sockaddr_in*) &sa_dst)->sin_addr,
                      (void*) &dst_sa4.sin_addr,
-                     n, (uint16_t) port, payload, &ss);
+                     n, (uint16_t) port, payload, &ss, enable_opus);
 #ifdef HAVE_IPV6
     } else {
         p = pa_sdp_build(af,
                      (void*) &((struct sockaddr_in6*) &sa_dst)->sin6_addr,
                      (void*) &dst_sa6.sin6_addr,
-                     n, (uint16_t) port, payload, &ss);
+                     n, (uint16_t) port, payload, &ss, enable_opus);
 #endif
     }
 
     pa_xfree(n);
 
-    if (!(u->rtp_context = pa_rtp_context_new_send(fd, payload, mtu, &ss)))
+    if (!(u->rtp_context = pa_rtp_context_new_send(fd, payload, mtu, &ss, enable_opus)))
         goto fail;
     pa_sap_context_init_send(&u->sap_context, sap_fd, p);
 

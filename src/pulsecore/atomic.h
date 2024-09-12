@@ -21,6 +21,7 @@
   License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <stdint.h>
 #include <pulsecore/macro.h>
 
 /*
@@ -103,10 +104,10 @@ static inline bool pa_atomic_cmpxchg(pa_atomic_t *a, int old_i, int new_i) {
 }
 
 typedef struct pa_atomic_ptr {
-    volatile unsigned long value;
+    volatile uintptr_t value;
 } pa_atomic_ptr_t;
 
-#define PA_ATOMIC_PTR_INIT(v) { .value = (long) (v) }
+#define PA_ATOMIC_PTR_INIT(v) { .value = (uintptr_t) (v) }
 
 #ifdef HAVE_ATOMIC_BUILTINS_MEMORY_MODEL
 
@@ -117,7 +118,7 @@ static inline void* pa_atomic_ptr_load(const pa_atomic_ptr_t *a) {
 }
 
 static inline void pa_atomic_ptr_store(pa_atomic_ptr_t *a, void* p) {
-    __atomic_store_n(&a->value, (unsigned long) p, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&a->value, (uintptr_t) p, __ATOMIC_SEQ_CST);
 }
 
 #else
@@ -128,14 +129,14 @@ static inline void* pa_atomic_ptr_load(const pa_atomic_ptr_t *a) {
 }
 
 static inline void pa_atomic_ptr_store(pa_atomic_ptr_t *a, void *p) {
-    a->value = (unsigned long) p;
+    a->value = (uintptr_t) p;
     __sync_synchronize();
 }
 
 #endif
 
 static inline bool pa_atomic_ptr_cmpxchg(pa_atomic_ptr_t *a, void *old_p, void* new_p) {
-    return __sync_bool_compare_and_swap(&a->value, (long) old_p, (long) new_p);
+    return __sync_bool_compare_and_swap(&a->value, (uintptr_t) old_p, (uintptr_t) new_p);
 }
 
 #elif defined(__NetBSD__) && defined(HAVE_SYS_ATOMIC_H)
@@ -218,39 +219,6 @@ static inline bool pa_atomic_ptr_cmpxchg(pa_atomic_ptr_t *a, void *old_p, void* 
 #include <sys/param.h>
 #include <machine/atomic.h>
 
-#if __FreeBSD_version < 600000
-#if defined(__i386__) || defined(__amd64__)
-#if defined(__amd64__)
-#define atomic_load_acq_64      atomic_load_acq_long
-#endif
-static inline u_int atomic_fetchadd_int(volatile u_int *p, u_int v) {
-    __asm __volatile(
-            "   " __XSTRING(MPLOCKED) "         "
-            "   xaddl   %0, %1 ;        "
-            "# atomic_fetchadd_int"
-            : "+r" (v),
-            "=m" (*p)
-            : "m" (*p));
-
-    return (v);
-}
-#elif defined(__sparc__) && defined(__arch64__)
-#define atomic_load_acq_64      atomic_load_acq_long
-#define atomic_fetchadd_int     atomic_add_int
-#elif defined(__ia64__)
-#define atomic_load_acq_64      atomic_load_acq_long
-static inline uint32_t
-atomic_fetchadd_int(volatile uint32_t *p, uint32_t v) {
-    uint32_t value;
-
-    do {
-        value = *p;
-    } while (!atomic_cmpset_32(p, value, value + v));
-    return (value);
-}
-#endif
-#endif
-
 typedef struct pa_atomic {
     volatile unsigned long value;
 } pa_atomic_t;
@@ -317,7 +285,7 @@ static inline int pa_atomic_ptr_cmpxchg(pa_atomic_ptr_t *a, void *old_p, void* n
 
 #elif defined(__GNUC__) && (defined(__amd64__) || defined(__x86_64__))
 
-#warn "The native atomic operations implementation for AMD64 has not been tested thoroughly. libatomic_ops is known to not work properly on AMD64 and your gcc version is too old for the gcc-builtin atomic ops support. You have three options now: test the native atomic operations implementation for AMD64, fix libatomic_ops, or upgrade your GCC."
+#warning "The native atomic operations implementation for AMD64 has not been tested thoroughly. libatomic_ops is known to not work properly on AMD64 and your gcc version is too old for the gcc-builtin atomic ops support. You have three options now: test the native atomic operations implementation for AMD64, fix libatomic_ops, or upgrade your GCC."
 
 /* Adapted from glibc */
 

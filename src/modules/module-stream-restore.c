@@ -113,10 +113,9 @@ struct userdata {
 #endif
 };
 
-#define ENTRY_VERSION 1
+#define ENTRY_VERSION 2
 
 struct entry {
-    uint8_t version;
     bool muted_valid, volume_valid, device_valid, card_valid;
     bool muted;
     pa_channel_map channel_map;
@@ -968,7 +967,6 @@ static void save_time_callback(pa_mainloop_api*a, pa_time_event* e, const struct
 
 static struct entry* entry_new(void) {
     struct entry *r = pa_xnew0(struct entry, 1);
-    r->version = ENTRY_VERSION;
     return r;
 }
 
@@ -990,7 +988,7 @@ static bool entry_write(struct userdata *u, const char *name, const struct entry
     pa_assert(e);
 
     t = pa_tagstruct_new();
-    pa_tagstruct_putu8(t, e->version);
+    pa_tagstruct_putu8(t, ENTRY_VERSION);
     pa_tagstruct_put_boolean(t, e->volume_valid);
     pa_tagstruct_put_channel_map(t, &e->channel_map);
     pa_tagstruct_put_cvolume(t, &e->volume);
@@ -1031,6 +1029,8 @@ static struct entry *legacy_entry_read(struct userdata *u, const char *name) {
     pa_datum data;
     struct legacy_entry *le;
     struct entry *e;
+    pa_channel_map channel_map;
+    pa_cvolume volume;
 
     pa_assert(u);
     pa_assert(name);
@@ -1075,12 +1075,17 @@ static struct entry *legacy_entry_read(struct userdata *u, const char *name) {
         goto fail;
     }
 
-    if (le->volume_valid && !pa_channel_map_valid(&le->channel_map)) {
+    /* Read these out before accessing contents via pointers as struct legacy_entry may not be adequately aligned for these
+     * members to be accessed directly */
+    channel_map = le->channel_map;
+    volume = le->volume;
+
+    if (le->volume_valid && !pa_channel_map_valid(&channel_map)) {
         pa_log_warn("Invalid channel map stored in database for legacy stream");
         goto fail;
     }
 
-    if (le->volume_valid && (!pa_cvolume_valid(&le->volume) || !pa_cvolume_compatible_with_channel_map(&le->volume, &le->channel_map))) {
+    if (le->volume_valid && (!pa_cvolume_valid(&volume) || !pa_cvolume_compatible_with_channel_map(&volume, &channel_map))) {
         pa_log_warn("Invalid volume stored in database for legacy stream");
         goto fail;
     }
@@ -1108,6 +1113,7 @@ static struct entry *entry_read(struct userdata *u, const char *name) {
     pa_datum key, data;
     struct entry *e = NULL;
     pa_tagstruct *t = NULL;
+    uint8_t version;
     const char *device, *card;
 
     pa_assert(u);
@@ -1124,8 +1130,8 @@ static struct entry *entry_read(struct userdata *u, const char *name) {
     t = pa_tagstruct_new_fixed(data.data, data.size);
     e = entry_new();
 
-    if (pa_tagstruct_getu8(t, &e->version) < 0 ||
-        e->version > ENTRY_VERSION ||
+    if (pa_tagstruct_getu8(t, &version) < 0 ||
+        version > ENTRY_VERSION ||
         pa_tagstruct_get_boolean(t, &e->volume_valid) < 0 ||
         pa_tagstruct_get_channel_map(t, &e->channel_map) < 0 ||
         pa_tagstruct_get_cvolume(t, &e->volume) < 0 ||
@@ -1145,12 +1151,12 @@ static struct entry *entry_read(struct userdata *u, const char *name) {
     if (!pa_tagstruct_eof(t))
         goto fail;
 
-    if (e->device_valid && !pa_namereg_is_valid_name(e->device)) {
+    if (e->device_valid && (!e->device || !pa_namereg_is_valid_name(e->device))) {
         pa_log_warn("Invalid device name stored in database for stream %s", name);
         goto fail;
     }
 
-    if (e->card_valid && !pa_namereg_is_valid_name(e->card)) {
+    if (e->card_valid && (!e->card || !pa_namereg_is_valid_name(e->card))) {
         pa_log_warn("Invalid card name stored in database for stream %s", name);
         goto fail;
     }
@@ -1167,6 +1173,46 @@ static struct entry *entry_read(struct userdata *u, const char *name) {
 
     pa_tagstruct_free(t);
     pa_datum_free(&data);
+
+#ifdef STREAM_RESTORE_CLEAR_OLD_DEVICES
+    if (version < 2 && e->device_valid) {
+        /* Prior to PulseAudio 14.0, GNOME's sound settings overwrote the
+         * routing for all entries in the stream-restore database when
+         * selecting a device. PulseAudio 14.0 prevents that from happening,
+         * but the old overwritten settings can still be in the database after
+         * updating to PulseAudio 14.0, and they can cause problems, as
+         * documented here:
+         * https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/issues/832
+         *
+         * We can't distinguish between devices set by GNOME's sound settings
+         * and devices set by the user, so we discard all old device settings,
+         * even though that is going to cause PulseAudio to forget routing
+         * settings for many users. This is less bad than keeping the incorrect
+         * routing settings in the database, because it's difficult for users
+         * to figure out how to fix the situation when e.g. speaker test tones
+         * go to the internal speakers no matter what device is selected as the
+         * default, whereas old manual configuration can be restored restored
+         * by doing the manual configuration again. Also, it's probably more
+         * common to have at some point changed the default device in GNOME's
+         * sound settings than it is to have any manual per-stream routing
+         * settings. */
+        pa_log_warn("Device set, but it might be incorrect. Clearing the device. If this messes up your manual stream "
+                    "routing configuration, sorry about that. This is a workaround for this bug: "
+                    "https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/issues/832");
+        pa_log_warn("%s: device: %s -> (unset)", name, e->device);
+        pa_xfree(e->device);
+        e->device = NULL;
+        e->device_valid = false;
+        if (e->card_valid) {
+            pa_log_warn("%s: card: %s -> (unset)", name, e->card);
+            pa_xfree(e->card);
+            e->card = NULL;
+            e->card_valid = false;
+        }
+        entry_write(u, name, e, true);
+        trigger_save(u);
+    }
+#endif
 
     return e;
 
@@ -1248,7 +1294,6 @@ static void subscribe_callback(pa_core *c, pa_subscription_event_type_t t, uint3
     /* These are only used when D-Bus is enabled, but in order to reduce ifdef
      * clutter these are defined here unconditionally. */
     bool created_new_entry = true;
-    bool device_updated = false;
     bool volume_updated = false;
     bool mute_updated = false;
 
@@ -1304,25 +1349,6 @@ static void subscribe_callback(pa_core *c, pa_subscription_event_type_t t, uint3
 
             mute_updated = !created_new_entry && (!old->muted_valid || entry->muted != old->muted);
         }
-
-        if (sink_input->preferred_sink != NULL || !created_new_entry) {
-            pa_sink *s = NULL;
-
-            pa_xfree(entry->device);
-            entry->device = pa_xstrdup(sink_input->preferred_sink);
-            entry->device_valid = true;
-            if (!entry->device)
-                entry->device_valid = false;
-
-            device_updated = !created_new_entry && !pa_safe_streq(entry->device, old->device);
-            pa_xfree(entry->card);
-            entry->card = NULL;
-            entry->card_valid = false;
-            if (entry->device_valid && (s = pa_namereg_get(c, entry->device, PA_NAMEREG_SINK)) && s->card) {
-                entry->card = pa_xstrdup(s->card->name);
-                entry->card_valid = true;
-            }
-        }
     } else {
         pa_source_output *source_output;
 
@@ -1364,26 +1390,6 @@ static void subscribe_callback(pa_core *c, pa_subscription_event_type_t t, uint3
 
             mute_updated = !created_new_entry && (!old->muted_valid || entry->muted != old->muted);
         }
-
-        if (source_output->preferred_source != NULL || !created_new_entry) {
-            pa_source *s = NULL;
-
-            pa_xfree(entry->device);
-            entry->device = pa_xstrdup(source_output->preferred_source);
-            entry->device_valid = true;
-
-            if (!entry->device)
-                entry->device_valid = false;
-
-            device_updated = !created_new_entry && !pa_safe_streq(entry->device, old->device);
-            pa_xfree(entry->card);
-            entry->card = NULL;
-            entry->card_valid = false;
-            if (entry->device_valid && (s = pa_namereg_get(c, entry->device, PA_NAMEREG_SOURCE)) && s->card) {
-                entry->card = pa_xstrdup(s->card->name);
-                entry->card_valid = true;
-            }
-        }
     }
 
     pa_assert(entry);
@@ -1400,21 +1406,20 @@ static void subscribe_callback(pa_core *c, pa_subscription_event_type_t t, uint3
         entry_free(old);
     }
 
-    pa_log_info("Storing volume/mute/device for stream %s.", name);
+    pa_log_info("Storing volume/mute for stream %s.", name);
 
-    if (entry_write(u, name, entry, true))
+    if (entry_write(u, name, entry, true)) {
         trigger_save(u);
+    } else {
+        pa_log_error("Could not store volume/mute for stream %s.", name);
+    }
 
 #ifdef HAVE_DBUS
-    if (created_new_entry) {
+    if (!(de = pa_hashmap_get(u->dbus_entries, name))) {
         de = dbus_entry_new(u, name);
         pa_assert_se(pa_hashmap_put(u->dbus_entries, de->entry_name, de) == 0);
         send_new_entry_signal(de);
     } else {
-        pa_assert_se(de = pa_hashmap_get(u->dbus_entries, name));
-
-        if (device_updated)
-            send_device_updated_signal(de, entry);
         if (volume_updated)
             send_volume_updated_signal(de, entry);
         if (mute_updated)
@@ -1422,7 +1427,6 @@ static void subscribe_callback(pa_core *c, pa_subscription_event_type_t t, uint3
     }
 #else
     /* Silence compiler warnings */
-    (void) device_updated;
     (void) volume_updated;
     (void) mute_updated;
 #endif
@@ -1530,6 +1534,79 @@ static pa_hook_result_t sink_input_fixate_hook_callback(pa_core *c, pa_sink_inpu
         entry_free(e);
     }
 
+    pa_xfree(name);
+
+    return PA_HOOK_OK;
+}
+
+static void update_preferred_device(struct userdata *u, const char *name, const char *device, const char *card) {
+    struct entry *old;
+    struct entry *entry;
+#ifdef HAVE_DBUS
+    bool created_new_entry = false;
+    struct dbus_entry *de;
+#endif
+
+    pa_assert(u);
+    pa_assert(name);
+
+    if ((old = entry_read(u, name)))
+        entry = entry_copy(old);
+    else {
+        entry = entry_new();
+#ifdef HAVE_DBUS
+        created_new_entry = true;
+#endif
+    }
+
+    pa_xfree(entry->device);
+    entry->device = pa_xstrdup(device);
+    entry->device_valid = !!device;
+
+    pa_xfree(entry->card);
+    entry->card = pa_xstrdup(card);
+    entry->card_valid = !!card;
+
+    pa_log_info("Storing device for stream %s.", name);
+
+    entry_write(u, name, entry, true);
+    trigger_save(u);
+
+#if HAVE_DBUS
+    if (!(de = pa_hashmap_get(u->dbus_entries, name))) {
+        de = dbus_entry_new(u, name);
+        pa_assert_se(pa_hashmap_put(u->dbus_entries, de->entry_name, de) == 0);
+        send_new_entry_signal(de);
+    } else {
+        /* We send a D-Bus signal when the device changes, but not when the
+         * card changes. That's becaues the D-Bus interface doesn't expose the
+         * card field to clients at all. */
+        if (!created_new_entry && !pa_safe_streq(entry->device, old->device))
+            send_device_updated_signal(de, entry);
+    }
+#endif
+
+    entry_free(entry);
+    if (old)
+        entry_free(old);
+}
+
+static pa_hook_result_t sink_input_preferred_sink_changed_cb(pa_core *c, pa_sink_input *sink_input, struct userdata *u) {
+    char *name;
+    pa_sink *sink;
+    const char *card_name = NULL;
+
+    pa_assert(c);
+    pa_assert(sink_input);
+    pa_assert(u);
+
+    if (!(name = pa_proplist_get_stream_group(sink_input->proplist, "sink-input", IDENTIFICATION_PROPERTY)))
+        return PA_HOOK_OK;
+
+    if (sink_input->preferred_sink && (sink = pa_namereg_get(c, sink_input->preferred_sink, PA_NAMEREG_SINK)) && sink->card)
+        card_name = sink->card->name;
+
+    update_preferred_device(u, name, sink_input->preferred_sink, card_name);
     pa_xfree(name);
 
     return PA_HOOK_OK;
@@ -1643,6 +1720,27 @@ static pa_hook_result_t source_output_fixate_hook_callback(pa_core *c, pa_source
     return PA_HOOK_OK;
 }
 
+static pa_hook_result_t source_output_preferred_source_changed_cb(pa_core *c, pa_source_output *source_output, struct userdata *u) {
+    char *name;
+    pa_source *source;
+    const char *card_name = NULL;
+
+    pa_assert(c);
+    pa_assert(source_output);
+    pa_assert(u);
+
+    if (!(name = pa_proplist_get_stream_group(source_output->proplist, "source-output", IDENTIFICATION_PROPERTY)))
+        return PA_HOOK_OK;
+
+    if (source_output->preferred_source && (source = pa_namereg_get(c, source_output->preferred_source, PA_NAMEREG_SOURCE)) && source->card)
+        card_name = source->card->name;
+
+    update_preferred_device(u, name, source_output->preferred_source, card_name);
+    pa_xfree(name);
+
+    return PA_HOOK_OK;
+}
+
 static int fill_db(struct userdata *u, const char *filename) {
     FILE *f;
     int n = 0;
@@ -1694,7 +1792,6 @@ static int fill_db(struct userdata *u, const char *filename) {
                 struct entry e;
 
                 pa_zero(e);
-                e.version = ENTRY_VERSION;
                 e.volume_valid = true;
                 pa_cvolume_set(&e.volume, 1, pa_sw_volume_from_dB(db));
                 pa_channel_map_init_mono(&e.channel_map);
@@ -2220,7 +2317,7 @@ static void clean_up_db(struct userdata *u) {
 int pa__init(pa_module*m) {
     pa_modargs *ma = NULL;
     struct userdata *u;
-    char *fname;
+    char *state_path;
     pa_sink_input *si;
     pa_source_output *so;
     uint32_t idx;
@@ -2271,6 +2368,11 @@ int pa__init(pa_module*m) {
         /* A little bit earlier than module-intended-roles ... */
         pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SINK_INPUT_NEW], PA_HOOK_EARLY, (pa_hook_cb_t) sink_input_new_hook_callback, u);
         pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_NEW], PA_HOOK_EARLY, (pa_hook_cb_t) source_output_new_hook_callback, u);
+
+        pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SINK_INPUT_PREFERRED_SINK_CHANGED], PA_HOOK_NORMAL,
+                               (pa_hook_cb_t) sink_input_preferred_sink_changed_cb, u);
+        pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_PREFERRED_SOURCE_CHANGED], PA_HOOK_NORMAL,
+                               (pa_hook_cb_t) source_output_preferred_source_changed_cb, u);
     }
 
     if (restore_volume || restore_muted) {
@@ -2278,17 +2380,15 @@ int pa__init(pa_module*m) {
         pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_FIXATE], PA_HOOK_EARLY, (pa_hook_cb_t) source_output_fixate_hook_callback, u);
     }
 
-    if (!(fname = pa_state_path("stream-volumes", true)))
+    if (!(state_path = pa_state_path(NULL, true)))
         goto fail;
 
-    if (!(u->database = pa_database_open(fname, true))) {
-        pa_log("Failed to open volume database '%s': %s", fname, pa_cstrerror(errno));
-        pa_xfree(fname);
+    if (!(u->database = pa_database_open(state_path, "stream-volumes", true, true))) {
+        pa_xfree(state_path);
         goto fail;
     }
 
-    pa_log_info("Successfully opened database file '%s'.", fname);
-    pa_xfree(fname);
+    pa_xfree(state_path);
 
     clean_up_db(u);
 

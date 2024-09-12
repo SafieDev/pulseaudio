@@ -40,6 +40,7 @@
 #include <pulsecore/thread.h>
 #include <pulsecore/conf-parser.h>
 #include <pulsecore/core-rtclock.h>
+#include <pulsecore/strbuf.h>
 
 #include "alsa-util.h"
 #include "alsa-mixer.h"
@@ -522,6 +523,8 @@ snd_pcm_t *pa_alsa_open_by_device_id_auto(
         snd_pcm_uframes_t tsched_size,
         bool *use_mmap,
         bool *use_tsched,
+        pa_sample_format_t **query_supported_formats,
+        unsigned int **query_supported_rates,
         pa_alsa_profile_set *ps,
         pa_alsa_mapping **mapping) {
 
@@ -560,6 +563,8 @@ snd_pcm_t *pa_alsa_open_by_device_id_auto(
                 tsched_size,
                 use_mmap,
                 use_tsched,
+                query_supported_formats,
+                query_supported_rates,
                 m);
 
         if (pcm_handle) {
@@ -587,6 +592,8 @@ snd_pcm_t *pa_alsa_open_by_device_id_auto(
                 tsched_size,
                 use_mmap,
                 use_tsched,
+                query_supported_formats,
+                query_supported_rates,
                 m);
 
         if (pcm_handle) {
@@ -611,6 +618,8 @@ snd_pcm_t *pa_alsa_open_by_device_id_auto(
             tsched_size,
             use_mmap,
             use_tsched,
+            query_supported_formats,
+            query_supported_rates,
             false);
     pa_xfree(d);
 
@@ -631,6 +640,8 @@ snd_pcm_t *pa_alsa_open_by_device_id_mapping(
         snd_pcm_uframes_t tsched_size,
         bool *use_mmap,
         bool *use_tsched,
+        pa_sample_format_t **query_supported_formats,
+        unsigned int **query_supported_rates,
         pa_alsa_mapping *m) {
 
     snd_pcm_t *pcm_handle;
@@ -660,6 +671,8 @@ snd_pcm_t *pa_alsa_open_by_device_id_mapping(
             tsched_size,
             use_mmap,
             use_tsched,
+            query_supported_formats,
+            query_supported_rates,
             pa_channel_map_valid(&m->channel_map) /* Query the channel count if we don't know what we want */);
 
     if (!pcm_handle)
@@ -683,6 +696,8 @@ snd_pcm_t *pa_alsa_open_by_device_string(
         snd_pcm_uframes_t tsched_size,
         bool *use_mmap,
         bool *use_tsched,
+        pa_sample_format_t **query_supported_formats,
+        unsigned int **query_supported_rates,
         bool require_exact_channel_number) {
 
     int err;
@@ -710,6 +725,12 @@ snd_pcm_t *pa_alsa_open_by_device_string(
 
         pa_log_debug("Managed to open %s", d);
 
+        if (query_supported_formats)
+            *query_supported_formats = pa_alsa_get_supported_formats(pcm_handle, ss->format);
+
+        if (query_supported_rates)
+            *query_supported_rates = pa_alsa_get_supported_rates(pcm_handle, ss->rate);
+
         if ((err = pa_alsa_set_hw_params(
                      pcm_handle,
                      ss,
@@ -731,7 +752,7 @@ snd_pcm_t *pa_alsa_open_by_device_string(
             if (!pa_startswith(d, "plug:") && !pa_startswith(d, "plughw:")) {
                 char *t;
 
-                t = pa_sprintf_malloc("plug:%s", d);
+                t = pa_sprintf_malloc("plug:SLAVE='%s'", d);
                 pa_xfree(d);
                 d = t;
 
@@ -783,6 +804,8 @@ snd_pcm_t *pa_alsa_open_by_template(
         snd_pcm_uframes_t tsched_size,
         bool *use_mmap,
         bool *use_tsched,
+        pa_sample_format_t **query_supported_formats,
+        unsigned int **query_supported_rates,
         bool require_exact_channel_number) {
 
     snd_pcm_t *pcm_handle;
@@ -804,6 +827,8 @@ snd_pcm_t *pa_alsa_open_by_template(
                 tsched_size,
                 use_mmap,
                 use_tsched,
+                query_supported_formats,
+                query_supported_rates,
                 require_exact_channel_number);
 
         pa_xfree(d);
@@ -1180,7 +1205,7 @@ snd_pcm_sframes_t pa_alsa_safe_avail(snd_pcm_t *pcm, size_t hwbuf_size, const pa
 
         PA_ONCE_BEGIN {
             char *dn = pa_alsa_get_driver_name_by_pcm(pcm);
-            pa_log(ngettext("snd_pcm_avail() returned a value that is exceptionally large: %lu byte (%lu ms).\n"
+            pa_log_debug(ngettext("snd_pcm_avail() returned a value that is exceptionally large: %lu byte (%lu ms).\n"
                             "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers.",
                             "snd_pcm_avail() returned a value that is exceptionally large: %lu bytes (%lu ms).\n"
                             "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers.",
@@ -1189,7 +1214,7 @@ snd_pcm_sframes_t pa_alsa_safe_avail(snd_pcm_t *pcm, size_t hwbuf_size, const pa
                    (unsigned long) (pa_bytes_to_usec(k, ss) / PA_USEC_PER_MSEC),
                    pa_strnull(dn));
             pa_xfree(dn);
-            pa_alsa_dump(PA_LOG_ERROR, pcm);
+            pa_alsa_dump(PA_LOG_DEBUG, pcm);
         } PA_ONCE_END;
 
         /* Mhmm, let's try not to fail completely */
@@ -1246,7 +1271,7 @@ int pa_alsa_safe_delay(snd_pcm_t *pcm, snd_pcm_status_t *status, snd_pcm_sframes
 
         PA_ONCE_BEGIN {
             char *dn = pa_alsa_get_driver_name_by_pcm(pcm);
-            pa_log(ngettext("snd_pcm_delay() returned a value that is exceptionally large: %li byte (%s%lu ms).\n"
+            pa_log_debug(ngettext("snd_pcm_delay() returned a value that is exceptionally large: %li byte (%s%lu ms).\n"
                             "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers.",
                             "snd_pcm_delay() returned a value that is exceptionally large: %li bytes (%s%lu ms).\n"
                             "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers.",
@@ -1256,7 +1281,7 @@ int pa_alsa_safe_delay(snd_pcm_t *pcm, snd_pcm_status_t *status, snd_pcm_sframes
                    (unsigned long) (pa_bytes_to_usec(abs_k, ss) / PA_USEC_PER_MSEC),
                    pa_strnull(dn));
             pa_xfree(dn);
-            pa_alsa_dump(PA_LOG_ERROR, pcm);
+            pa_alsa_dump(PA_LOG_DEBUG, pcm);
         } PA_ONCE_END;
 
         /* Mhmm, let's try not to fail completely */
@@ -1274,7 +1299,7 @@ int pa_alsa_safe_delay(snd_pcm_t *pcm, snd_pcm_status_t *status, snd_pcm_sframes
 
             PA_ONCE_BEGIN {
                 char *dn = pa_alsa_get_driver_name_by_pcm(pcm);
-                pa_log(ngettext("snd_pcm_avail() returned a value that is exceptionally large: %lu byte (%lu ms).\n"
+                pa_log_debug(ngettext("snd_pcm_avail() returned a value that is exceptionally large: %lu byte (%lu ms).\n"
                                 "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers.",
                                 "snd_pcm_avail() returned a value that is exceptionally large: %lu bytes (%lu ms).\n"
                                 "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers.",
@@ -1283,7 +1308,7 @@ int pa_alsa_safe_delay(snd_pcm_t *pcm, snd_pcm_status_t *status, snd_pcm_sframes
                        (unsigned long) (pa_bytes_to_usec(k, ss) / PA_USEC_PER_MSEC),
                        pa_strnull(dn));
                 pa_xfree(dn);
-                pa_alsa_dump(PA_LOG_ERROR, pcm);
+                pa_alsa_dump(PA_LOG_DEBUG, pcm);
             } PA_ONCE_END;
 
             /* Mhmm, let's try not to fail completely */
@@ -1336,7 +1361,7 @@ int pa_alsa_safe_mmap_begin(snd_pcm_t *pcm, const snd_pcm_channel_area_t **areas
                     k >= pa_bytes_per_second(ss)*10))
         PA_ONCE_BEGIN {
             char *dn = pa_alsa_get_driver_name_by_pcm(pcm);
-            pa_log(ngettext("snd_pcm_mmap_begin() returned a value that is exceptionally large: %lu byte (%lu ms).\n"
+            pa_log_debug(ngettext("snd_pcm_mmap_begin() returned a value that is exceptionally large: %lu byte (%lu ms).\n"
                             "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers.",
                             "snd_pcm_mmap_begin() returned a value that is exceptionally large: %lu bytes (%lu ms).\n"
                             "Most likely this is a bug in the ALSA driver '%s'. Please report this issue to the ALSA developers.",
@@ -1345,7 +1370,7 @@ int pa_alsa_safe_mmap_begin(snd_pcm_t *pcm, const snd_pcm_channel_area_t **areas
                    (unsigned long) (pa_bytes_to_usec(k, ss) / PA_USEC_PER_MSEC),
                    pa_strnull(dn));
             pa_xfree(dn);
-            pa_alsa_dump(PA_LOG_ERROR, pcm);
+            pa_alsa_dump(PA_LOG_DEBUG, pcm);
         } PA_ONCE_END;
 
     return r;
@@ -1406,13 +1431,31 @@ char *pa_alsa_get_reserve_name(const char *device) {
     return pa_sprintf_malloc("Audio%i", i);
 }
 
+static void dump_supported_rates(unsigned int* values)
+{
+    pa_strbuf *buf;
+    char *str;
+    int i;
+
+    buf = pa_strbuf_new();
+
+    for (i = 0; values[i]; i++) {
+        pa_strbuf_printf(buf, " %u", values[i]);
+    }
+
+    str = pa_strbuf_to_string_free(buf);
+    pa_log_debug("Supported rates:%s", str);
+    pa_xfree(str);
+}
+
 unsigned int *pa_alsa_get_supported_rates(snd_pcm_t *pcm, unsigned int fallback_rate) {
     static unsigned int all_rates[] = { 8000, 11025, 12000,
                                         16000, 22050, 24000,
                                         32000, 44100, 48000,
                                         64000, 88200, 96000,
                                         128000, 176400, 192000,
-                                        384000 };
+                                        352800, 384000,
+                                        705600, 768000 };
     bool supported[PA_ELEMENTSOF(all_rates)] = { false, };
     snd_pcm_hw_params_t *hwparams;
     unsigned int i, j, n, *rates = NULL;
@@ -1454,39 +1497,40 @@ unsigned int *pa_alsa_get_supported_rates(snd_pcm_t *pcm, unsigned int fallback_
         rates[1] = 0;
     }
 
+    dump_supported_rates(rates);
     return rates;
 }
 
 pa_sample_format_t *pa_alsa_get_supported_formats(snd_pcm_t *pcm, pa_sample_format_t fallback_format) {
-    static const snd_pcm_format_t format_trans_to_pa[] = {
-        [SND_PCM_FORMAT_U8] = PA_SAMPLE_U8,
-        [SND_PCM_FORMAT_A_LAW] = PA_SAMPLE_ALAW,
-        [SND_PCM_FORMAT_MU_LAW] = PA_SAMPLE_ULAW,
-        [SND_PCM_FORMAT_S16_LE] = PA_SAMPLE_S16LE,
-        [SND_PCM_FORMAT_S16_BE] = PA_SAMPLE_S16BE,
-        [SND_PCM_FORMAT_FLOAT_LE] = PA_SAMPLE_FLOAT32LE,
-        [SND_PCM_FORMAT_FLOAT_BE] = PA_SAMPLE_FLOAT32BE,
-        [SND_PCM_FORMAT_S32_LE] = PA_SAMPLE_S32LE,
-        [SND_PCM_FORMAT_S32_BE] = PA_SAMPLE_S32BE,
-        [SND_PCM_FORMAT_S24_3LE] = PA_SAMPLE_S24LE,
-        [SND_PCM_FORMAT_S24_3BE] = PA_SAMPLE_S24BE,
-        [SND_PCM_FORMAT_S24_LE] = PA_SAMPLE_S24_32LE,
-        [SND_PCM_FORMAT_S24_BE] = PA_SAMPLE_S24_32BE,
+    static const snd_pcm_format_t format_trans_to_pcm[] = {
+        [PA_SAMPLE_U8] = SND_PCM_FORMAT_U8,
+        [PA_SAMPLE_ALAW] = SND_PCM_FORMAT_A_LAW,
+        [PA_SAMPLE_ULAW] = SND_PCM_FORMAT_MU_LAW,
+        [PA_SAMPLE_S16LE] = SND_PCM_FORMAT_S16_LE,
+        [PA_SAMPLE_S16BE] = SND_PCM_FORMAT_S16_BE,
+        [PA_SAMPLE_FLOAT32LE] = SND_PCM_FORMAT_FLOAT_LE,
+        [PA_SAMPLE_FLOAT32BE] = SND_PCM_FORMAT_FLOAT_BE,
+        [PA_SAMPLE_S32LE] = SND_PCM_FORMAT_S32_LE,
+        [PA_SAMPLE_S32BE] = SND_PCM_FORMAT_S32_BE,
+        [PA_SAMPLE_S24LE] = SND_PCM_FORMAT_S24_3LE,
+        [PA_SAMPLE_S24BE] = SND_PCM_FORMAT_S24_3BE,
+        [PA_SAMPLE_S24_32LE] = SND_PCM_FORMAT_S24_LE,
+        [PA_SAMPLE_S24_32BE] = SND_PCM_FORMAT_S24_BE,
     };
-    static const snd_pcm_format_t all_formats[] = {
-        SND_PCM_FORMAT_U8,
-        SND_PCM_FORMAT_A_LAW,
-        SND_PCM_FORMAT_MU_LAW,
-        SND_PCM_FORMAT_S16_LE,
-        SND_PCM_FORMAT_S16_BE,
-        SND_PCM_FORMAT_FLOAT_LE,
-        SND_PCM_FORMAT_FLOAT_BE,
-        SND_PCM_FORMAT_S32_LE,
-        SND_PCM_FORMAT_S32_BE,
-        SND_PCM_FORMAT_S24_3LE,
-        SND_PCM_FORMAT_S24_3BE,
-        SND_PCM_FORMAT_S24_LE,
-        SND_PCM_FORMAT_S24_BE,
+    static const pa_sample_format_t all_formats[] = {
+        PA_SAMPLE_U8,
+        PA_SAMPLE_ALAW,
+        PA_SAMPLE_ULAW,
+        PA_SAMPLE_S16LE,
+        PA_SAMPLE_S16BE,
+        PA_SAMPLE_FLOAT32LE,
+        PA_SAMPLE_FLOAT32BE,
+        PA_SAMPLE_S32LE,
+        PA_SAMPLE_S32BE,
+        PA_SAMPLE_S24LE,
+        PA_SAMPLE_S24BE,
+        PA_SAMPLE_S24_32LE,
+        PA_SAMPLE_S24_32BE,
     };
     bool supported[PA_ELEMENTSOF(all_formats)] = {
         false,
@@ -1504,7 +1548,7 @@ pa_sample_format_t *pa_alsa_get_supported_formats(snd_pcm_t *pcm, pa_sample_form
     }
 
     for (i = 0, n = 0; i < PA_ELEMENTSOF(all_formats); i++) {
-        if (snd_pcm_hw_params_test_format(pcm, hwparams, all_formats[i]) == 0) {
+        if (snd_pcm_hw_params_test_format(pcm, hwparams, format_trans_to_pcm[all_formats[i]]) == 0) {
             supported[i] = true;
             n++;
         }
@@ -1515,7 +1559,7 @@ pa_sample_format_t *pa_alsa_get_supported_formats(snd_pcm_t *pcm, pa_sample_form
 
         for (i = 0, j = 0; i < PA_ELEMENTSOF(all_formats); i++) {
             if (supported[i])
-                formats[j++] = format_trans_to_pa[all_formats[i]];
+                formats[j++] = all_formats[i];
         }
 
         formats[j] = PA_SAMPLE_MAX;
@@ -1523,7 +1567,7 @@ pa_sample_format_t *pa_alsa_get_supported_formats(snd_pcm_t *pcm, pa_sample_form
         formats = pa_xnew(pa_sample_format_t, 2);
 
         formats[0] = fallback_format;
-        if ((ret = snd_pcm_hw_params_set_format(pcm, hwparams, format_trans_to_pa[formats[0]])) < 0) {
+        if ((ret = snd_pcm_hw_params_set_format(pcm, hwparams, format_trans_to_pcm[formats[0]])) < 0) {
             pa_log_debug("snd_pcm_hw_params_set_format() failed: %s", pa_alsa_strerror(ret));
             pa_xfree(formats);
             return NULL;
@@ -1614,14 +1658,16 @@ static snd_mixer_elem_t *pa_alsa_mixer_find(snd_mixer_t *mixer,
                                             snd_ctl_elem_iface_t iface,
                                             const char *name,
                                             unsigned int index,
-                                            unsigned int device) {
+                                            unsigned int device,
+                                            unsigned int subdevice) {
     snd_mixer_elem_t *elem;
 
     for (elem = snd_mixer_first_elem(mixer); elem; elem = snd_mixer_elem_next(elem)) {
-        snd_hctl_elem_t *helem;
+        snd_hctl_elem_t **_helem, *helem;
         if (snd_mixer_elem_get_type(elem) != SND_MIXER_ELEM_PULSEAUDIO)
             continue;
-        helem = snd_mixer_elem_get_private(elem);
+        _helem = snd_mixer_elem_get_private(elem);
+        helem = *_helem;
         if (snd_hctl_elem_get_interface(helem) != iface)
             continue;
         if (!pa_streq(snd_hctl_elem_get_name(helem), name))
@@ -1630,17 +1676,19 @@ static snd_mixer_elem_t *pa_alsa_mixer_find(snd_mixer_t *mixer,
             continue;
         if (snd_hctl_elem_get_device(helem) != device)
             continue;
+        if (snd_hctl_elem_get_subdevice(helem) != subdevice)
+            continue;
         return elem;
     }
     return NULL;
 }
 
-snd_mixer_elem_t *pa_alsa_mixer_find_card(snd_mixer_t *mixer, const char *name, unsigned int device) {
-    return pa_alsa_mixer_find(mixer, SND_CTL_ELEM_IFACE_CARD, name, 0, device);
+snd_mixer_elem_t *pa_alsa_mixer_find_card(snd_mixer_t *mixer, struct pa_alsa_mixer_id *alsa_id, unsigned int device) {
+    return pa_alsa_mixer_find(mixer, SND_CTL_ELEM_IFACE_CARD, alsa_id->name, alsa_id->index, device, 0);
 }
 
 snd_mixer_elem_t *pa_alsa_mixer_find_pcm(snd_mixer_t *mixer, const char *name, unsigned int device) {
-    return pa_alsa_mixer_find(mixer, SND_CTL_ELEM_IFACE_PCM, name, 0, device);
+    return pa_alsa_mixer_find(mixer, SND_CTL_ELEM_IFACE_PCM, name, 0, device, 0);
 }
 
 static int mixer_class_compare(const snd_mixer_elem_t *c1, const snd_mixer_elem_t *c2)
@@ -1649,31 +1697,79 @@ static int mixer_class_compare(const snd_mixer_elem_t *c1, const snd_mixer_elem_
     return c1 == c2 ? 0 : (c1 > c2 ? 1 : -1);
 }
 
+static void mixer_melem_free(snd_mixer_elem_t *elem)
+{
+    snd_hctl_elem_t **_helem;
+    _helem = snd_mixer_elem_get_private(elem);
+    pa_xfree(_helem);
+}
+
 static int mixer_class_event(snd_mixer_class_t *class, unsigned int mask,
 			snd_hctl_elem_t *helem, snd_mixer_elem_t *melem)
 {
     int err;
     const char *name = snd_hctl_elem_get_name(helem);
-    if (mask & SND_CTL_EVENT_MASK_ADD) {
+    snd_hctl_elem_t **_helem;
+    /* NOTE: The remove event is defined as '~0U`. */
+    if (mask == SND_CTL_EVENT_MASK_REMOVE) {
+        /* NOTE: Unless we remove the pointer to melem from the linked-list at
+         * private_data of helem, an assertion will be hit in alsa-lib since
+         * the list is not empty. */
+        _helem = snd_mixer_elem_get_private(melem);
+        *_helem = NULL;
+        snd_mixer_elem_detach(melem, helem);
+    } else if (mask & SND_CTL_EVENT_MASK_ADD) {
         snd_ctl_elem_iface_t iface = snd_hctl_elem_get_interface(helem);
         if (iface == SND_CTL_ELEM_IFACE_CARD || iface == SND_CTL_ELEM_IFACE_PCM) {
+            snd_mixer_t *mixer = snd_mixer_class_get_mixer(class);
+            snd_ctl_elem_iface_t iface = snd_hctl_elem_get_interface(helem);
+            const char *name = snd_hctl_elem_get_name(helem);
+            const int index = snd_hctl_elem_get_index(helem);
+            const int device = snd_hctl_elem_get_device(helem);
+            const int subdevice = snd_hctl_elem_get_subdevice(helem);
             snd_mixer_elem_t *new_melem;
+            bool found = true;
 
-            /* Put the hctl pointer as our private data - it will be useful for callbacks */
-            if ((err = snd_mixer_elem_new(&new_melem, SND_MIXER_ELEM_PULSEAUDIO, 0, helem, NULL)) < 0) {
-                pa_log_warn("snd_mixer_elem_new failed: %s", pa_alsa_strerror(err));
-                return 0;
+            new_melem = pa_alsa_mixer_find(mixer, iface, name, index, device, subdevice);
+            if (!new_melem) {
+                _helem = pa_xmalloc(sizeof(snd_hctl_elem_t *));
+                *_helem = helem;
+                /* Put the hctl pointer as our private data - it will be useful for callbacks */
+                if ((err = snd_mixer_elem_new(&new_melem, SND_MIXER_ELEM_PULSEAUDIO, 0, _helem, mixer_melem_free)) < 0) {
+                    pa_log_warn("snd_mixer_elem_new failed: %s", pa_alsa_strerror(err));
+                    return 0;
+                }
+                found = false;
+            } else {
+                _helem = snd_mixer_elem_get_private(new_melem);
+                if (_helem) {
+                    char *s1, *s2;
+                    snd_ctl_elem_id_t *id1, *id2;
+                    snd_ctl_elem_id_alloca(&id1);
+                    snd_ctl_elem_id_alloca(&id2);
+                    snd_hctl_elem_get_id(helem, id1);
+                    snd_hctl_elem_get_id(*_helem, id2);
+                    s1 = snd_ctl_ascii_elem_id_get(id1);
+                    s2 = snd_ctl_ascii_elem_id_get(id2);
+                    pa_log_warn("mixer_class_event - duplicate mixer controls: %s | %s", s1, s2);
+                    free(s2);
+                    free(s1);
+                    return 0;
+                }
+                *_helem = helem;
             }
 
             if ((err = snd_mixer_elem_attach(new_melem, helem)) < 0) {
                 pa_log_warn("snd_mixer_elem_attach failed: %s", pa_alsa_strerror(err));
-		snd_mixer_elem_free(melem);
+                snd_mixer_elem_free(melem);
                 return 0;
             }
 
-            if ((err = snd_mixer_elem_add(new_melem, class)) < 0) {
-                pa_log_warn("snd_mixer_elem_add failed: %s", pa_alsa_strerror(err));
-                return 0;
+            if (!found) {
+                if ((err = snd_mixer_elem_add(new_melem, class)) < 0) {
+                    pa_log_warn("snd_mixer_elem_add failed: %s", pa_alsa_strerror(err));
+                    return 0;
+                }
             }
         }
     }
@@ -1687,14 +1783,14 @@ static int mixer_class_event(snd_mixer_class_t *class, unsigned int mask,
     return 0;
 }
 
-static int prepare_mixer(snd_mixer_t *mixer, const char *dev) {
+static int prepare_mixer(snd_mixer_t *mixer, const char *dev, snd_hctl_t *hctl) {
     int err;
     snd_mixer_class_t *class;
 
     pa_assert(mixer);
     pa_assert(dev);
 
-    if ((err = snd_mixer_attach(mixer, dev)) < 0) {
+    if ((err = snd_mixer_attach_hctl(mixer, hctl)) < 0) {
         pa_log_info("Unable to attach to mixer %s: %s", dev, pa_alsa_strerror(err));
         return -1;
     }
@@ -1733,37 +1829,29 @@ snd_mixer_t *pa_alsa_open_mixer(pa_hashmap *mixers, int alsa_card_index, bool pr
     return m;
 }
 
+pa_alsa_mixer *pa_alsa_create_mixer(pa_hashmap *mixers, const char *dev, snd_mixer_t *m, bool probe) {
+    pa_alsa_mixer *pm;
+
+    pm = pa_xnew0(pa_alsa_mixer, 1);
+    if (pm == NULL)
+        return NULL;
+
+    pm->used_for_probe_only = probe;
+    pm->mixer_handle = m;
+    pa_hashmap_put(mixers, pa_xstrdup(dev), pm);
+    return pm;
+}
+
 snd_mixer_t *pa_alsa_open_mixer_by_name(pa_hashmap *mixers, const char *dev, bool probe) {
     int err;
     snd_mixer_t *m;
+    snd_hctl_t *hctl;
     pa_alsa_mixer *pm;
-    char *dev2;
-    void *state;
 
     pa_assert(mixers);
     pa_assert(dev);
 
     pm = pa_hashmap_get(mixers, dev);
-
-    /* The quick card number/index lookup (hw:#)
-     * We already know the card number/index, thus use the mixer
-     * from the cache at first.
-     */
-    if (!pm && pa_strneq(dev, "hw:", 3)) {
-        const char *s = dev + 3;
-        int card_index;
-        while (*s && *s >= 0 && *s <= '9') s++;
-        if (*s == '\0' && pa_atoi(dev + 3, &card_index) >= 0) {
-            PA_HASHMAP_FOREACH_KV(dev2, pm, mixers, state) {
-                if (pm->card_index == card_index) {
-                    dev = dev2;
-                    pm = pa_hashmap_get(mixers, dev);
-                    break;
-                }
-            }
-        }
-    }
-
     if (pm) {
         if (!probe)
             pm->used_for_probe_only = false;
@@ -1775,27 +1863,55 @@ snd_mixer_t *pa_alsa_open_mixer_by_name(pa_hashmap *mixers, const char *dev, boo
         return NULL;
     }
 
-    if (prepare_mixer(m, dev) >= 0) {
-        pm = pa_xnew0(pa_alsa_mixer, 1);
-        if (pm) {
-            snd_hctl_t *hctl;
-            pm->card_index = -1;
-            /* determine the ALSA card number (index) and store it to card_index */
-            err = snd_mixer_get_hctl(m, dev, &hctl);
-            if (err >= 0) {
-                snd_ctl_card_info_t *info;
-                snd_ctl_card_info_alloca(&info);
-                err = snd_ctl_card_info(snd_hctl_ctl(hctl), info);
-                if (err >= 0)
-                    pm->card_index = snd_ctl_card_info_get_card(info);
-            }
-            pm->used_for_probe_only = probe;
-            pm->mixer_handle = m;
-            pa_hashmap_put(mixers, pa_xstrdup(dev), pm);
-            return m;
-        }
+    err = snd_hctl_open(&hctl, dev, 0);
+    if (err < 0) {
+        pa_log("Error opening hctl device: %s", pa_alsa_strerror(err));
+        goto __close;
     }
 
+    if (prepare_mixer(m, dev, hctl) >= 0) {
+        /* get the ALSA card number (index) and ID (alias) and create two identical mixers */
+        char *p, *dev2, *dev_idx, *dev_id;
+        snd_ctl_card_info_t *info;
+        snd_ctl_card_info_alloca(&info);
+        err = snd_ctl_card_info(snd_hctl_ctl(hctl), info);
+        if (err < 0)
+            goto __std;
+        dev2 = pa_xstrdup(dev);
+        if (dev2 == NULL)
+            goto __close;
+        p = strchr(dev2, ':');
+        /* sanity check - only hw: devices */
+        if (p == NULL || (p - dev2) < 2 || !pa_strneq(p - 2, "hw:", 3)) {
+            pa_xfree(dev2);
+            goto __std;
+        }
+        *p = '\0';
+        dev_idx = pa_sprintf_malloc("%s:%u", dev2, snd_ctl_card_info_get_card(info));
+        dev_id = pa_sprintf_malloc("%s:%s", dev2, snd_ctl_card_info_get_id(info));
+        pa_log_debug("ALSA alias mixers: %s = %s", dev_idx, dev_id);
+        if (dev_idx && dev_id && (strcmp(dev, dev_idx) == 0 || strcmp(dev, dev_id) == 0)) {
+            pm = pa_alsa_create_mixer(mixers, dev_idx, m, probe);
+            if (pm) {
+                pa_alsa_mixer *pm2;
+                pm2 = pa_alsa_create_mixer(mixers, dev_id, m, probe);
+                if (pm2) {
+                    pm->alias = pm2;
+                    pm2->alias = pm;
+                }
+            }
+        }
+        pa_xfree(dev_id);
+        pa_xfree(dev_idx);
+        pa_xfree(dev2);
+   __std:
+        if (pm == NULL)
+            pm = pa_alsa_create_mixer(mixers, dev, m, probe);
+        if (pm)
+            return m;
+    }
+
+__close:
     snd_mixer_close(m);
     return NULL;
 }
@@ -1836,8 +1952,10 @@ void pa_alsa_mixer_free(pa_alsa_mixer *mixer)
 {
     if (mixer->fdl)
         pa_alsa_fdlist_free(mixer->fdl);
-    if (mixer->mixer_handle)
+    if (mixer->mixer_handle && mixer->alias == NULL)
         snd_mixer_close(mixer->mixer_handle);
+    if (mixer->alias)
+        mixer->alias->alias = NULL;
     pa_xfree(mixer);
 }
 

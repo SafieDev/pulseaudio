@@ -39,8 +39,9 @@
 #include "sdp.h"
 #include "rtp.h"
 
-char *pa_sdp_build(int af, const void *src, const void *dst, const char *name, uint16_t port, uint8_t payload, const pa_sample_spec *ss) {
+char *pa_sdp_build(int af, const void *src, const void *dst, const char *name, uint16_t port, uint8_t payload, const pa_sample_spec *ss, bool enable_opus) {
     uint32_t ntp;
+    uint32_t rate, channels;
     char buf_src[64], buf_dst[64], un[64];
     const char *u, *f;
 
@@ -53,7 +54,15 @@ char *pa_sdp_build(int af, const void *src, const void *dst, const char *name, u
     pa_assert(af == AF_INET);
 #endif
 
-    pa_assert_se(f = pa_rtp_format_to_string(ss->format));
+    if (enable_opus) {
+        f = "OPUS";
+        rate = 48000;
+        channels = 2;
+    } else {
+        pa_assert_se(f = pa_rtp_format_to_string(ss->format));
+        rate = ss->rate;
+        channels = ss->channels;
+    }
 
     if (!(u = pa_get_user_name(un, sizeof(un))))
         u = "-";
@@ -64,7 +73,7 @@ char *pa_sdp_build(int af, const void *src, const void *dst, const char *name, u
     pa_assert_se(inet_ntop(af, dst, buf_dst, sizeof(buf_dst)));
 
     return pa_sprintf_malloc(
-            PA_SDP_HEADER
+            PA_SDP_HEADER "\n"
             "o=%s %lu 0 IN %s %s\n"
             "s=%s\n"
             "c=IN %s %s\n"
@@ -78,7 +87,7 @@ char *pa_sdp_build(int af, const void *src, const void *dst, const char *name, u
             af == AF_INET ? "IP4" : "IP6", buf_dst,
             (unsigned long) ntp,
             port, payload,
-            payload, f, ss->rate, ss->channels);
+            payload, f, rate, channels);
 }
 
 static pa_sample_spec *parse_sdp_sample_spec(pa_sample_spec *ss, char *c) {
@@ -89,6 +98,9 @@ static pa_sample_spec *parse_sdp_sample_spec(pa_sample_spec *ss, char *c) {
     if (pa_startswith(c, "L16/")) {
         ss->format = PA_SAMPLE_S16BE;
         c += 4;
+    } else if (pa_startswith(c, "OPUS/")) {
+        ss->format = PA_SAMPLE_S16LE;
+        c += 5;
     } else
         return NULL;
 
@@ -117,18 +129,31 @@ pa_sdp_info *pa_sdp_parse(const char *t, pa_sdp_info *i, int is_goodbye) {
     i->origin = i->session_name = NULL;
     i->salen = 0;
     i->payload = 255;
+    i->enable_opus = false;
 
-    if (!pa_startswith(t, PA_SDP_HEADER)) {
+    if (pa_startswith(t, PA_SDP_HEADER)) {
+        t += sizeof(PA_SDP_HEADER) - 1;
+
+        /* CR delimiter is optional */
+        if (*t == '\r')
+            t++;
+
+        /* LF delimiter is mandatory */
+        if (*t == '\n')
+            t++;
+        else {
+            pa_log("Failed to parse SDP data: missing header record terminator LF.");
+            goto fail;
+        }
+    } else {
         pa_log("Failed to parse SDP data: invalid header.");
         goto fail;
     }
 
-    t += sizeof(PA_SDP_HEADER)-1;
-
     while (*t) {
         size_t l;
 
-        l = strcspn(t, "\n");
+        l = strcspn(t, "\r\n");
 
         if (l <= 2) {
             pa_log("Failed to parse SDP data: line too short: >%s<.", t);
@@ -218,6 +243,9 @@ pa_sdp_info *pa_sdp_parse(const char *t, pa_sdp_info *i, int is_goodbye) {
 
                         if (parse_sdp_sample_spec(&i->sample_spec, c))
                             ss_valid = true;
+
+                        if (pa_startswith(c, "OPUS/"))
+                            i->enable_opus = true;
                     }
                 }
             }
@@ -225,8 +253,17 @@ pa_sdp_info *pa_sdp_parse(const char *t, pa_sdp_info *i, int is_goodbye) {
 
         t += l;
 
+        /* CR delimiter is optional */
+        if (*t == '\r')
+            t++;
+
+        /* LF delimiter is mandatory */
         if (*t == '\n')
             t++;
+        else {
+            pa_log("Failed to parse SDP data: missing record terminator LF.");
+            goto fail;
+        }
     }
 
     if (!i->origin || (!is_goodbye && (!i->salen || i->payload > 127 || !ss_valid || port == 0))) {

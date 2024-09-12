@@ -91,7 +91,10 @@ struct shm_marker {
     uint64_t _reserved2;
     uint64_t _reserved3;
     uint64_t _reserved4;
-} PA_GCC_PACKED;
+};
+
+// Ensure struct is appropriately packed
+static_assert(sizeof(struct shm_marker) == 8 * 5, "`struct shm_marker` is not tightly packed");
 
 static inline size_t shm_marker_size(pa_mem_type_t type) {
     if (type == PA_MEM_TYPE_SHARED_POSIX)
@@ -161,7 +164,11 @@ static int sharedmem_create(pa_shm *m, pa_mem_type_t type, size_t size, mode_t m
 #endif
 #ifdef HAVE_MEMFD
     case PA_MEM_TYPE_SHARED_MEMFD:
-        fd = memfd_create("pulseaudio", MFD_ALLOW_SEALING);
+        /* For linux >= 6.3 create fd with MFD_NOEXEC_SEAL flag */
+        fd = memfd_create("pulseaudio", MFD_ALLOW_SEALING|MFD_CLOEXEC|MFD_NOEXEC_SEAL);
+        /* Retry creating fd without MFD_NOEXEC_SEAL to support linux < 6.3 */
+        if (fd < 0)
+            fd = memfd_create("pulseaudio", MFD_ALLOW_SEALING|MFD_CLOEXEC);
         break;
 #endif
     default:

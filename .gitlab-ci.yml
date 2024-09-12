@@ -2,13 +2,22 @@
 # container and push it to the project's container registry on fd.o GitLab.
 # This step is only run when the tag for the container changes, else it is
 # effectively a no-op. All of this infrastructure is inherited from the
-# wayland/ci-templates repository which is the recommended way to set up CI
+# freedesktop/ci-templates repository which is the recommended way to set up CI
 # infrastructure on fd.o GitLab.
 #
 # Once the container stage is done, we move on to the 'build' stage where we
-# run an autotools and meson build in parallel. Currently, tests are also run
-# as part of the build stage as there doesn't seem to be significant value to
-# splitting the stages at the moment.
+# run meson build. Currently, tests are also run as part of the build stage as
+# there doesn't seem to be significant value to splitting the stages at the
+# moment.
+
+# Create merge request pipelines for open merge requests, branch pipelines
+# otherwise. This allows MRs for new users to run CI.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
 
 stages:
   - container
@@ -16,24 +25,24 @@ stages:
 
 variables:
   # Update this tag when you want to trigger a rebuild the container in which
-  # CI runs, for example when adding new packages to UBUNTU_DEBS. The tag is
-  # an arbitrary string that identifies the exact container contents.
-  FDO_DISTRIBUTION_TAG: '2020-03-07-01'
-  FDO_DISTRIBUTION_VERSION: '18.04'
+  # CI runs, for example when adding new packages to FDO_DISTRIBUTION_PACKAGES.
+  # The tag is an arbitrary string that identifies the exact container
+  # contents.
+  FDO_DISTRIBUTION_TAG: '2023-08-13-00'
+  FDO_DISTRIBUTION_VERSION: '20.04'
   FDO_UPSTREAM_REPO: 'pulseaudio/pulseaudio'
-  UBUNTU_IMAGE: "$CI_REGISTRY_IMAGE/ubuntu/$FDO_DISTRIBUTION_VERSION:$FDO_DISTRIBUTION_TAG"
 
 include:
   # We pull templates from master to avoid the overhead of periodically
   # scanning for changes upstream. This does means builds might occasionally
   # break due to upstream changing things, so if you see unexpected build
   # failures, this might be one cause.
-  - project: 'wayland/ci-templates'
+  - project: 'freedesktop/ci-templates'
     ref: 'master'
     file: '/templates/ubuntu.yml'
 
 build-container:
-  extends: .fdo.container-ifnot-exists@ubuntu
+  extends: .fdo.container-build@ubuntu
   stage: container
   variables:
     GIT_STRATEGY: none # no need to pull the whole tree for rebuilding the image
@@ -42,13 +51,12 @@ build-container:
     # Otherwise the changes won't have effect since an old container image will
     # be used.
     FDO_DISTRIBUTION_PACKAGES: >-
-      autoconf
-      automake
       autopoint
       bash-completion
       check
       curl
       dbus-x11
+      doxygen
       g++
       gcc
       gettext
@@ -73,7 +81,6 @@ build-container:
       libssl-dev
       libsystemd-dev
       libtdb-dev
-      libtool
       libudev-dev
       libwebrtc-audio-processing-dev
       libwrap0-dev
@@ -82,47 +89,31 @@ build-container:
       libxml-parser-perl
       libxml2-utils
       libxtst-dev
-      make
+      m4
       ninja-build
       pkg-config
       python3-setuptools
       systemd
       wget
 
-build-autotools:
-  stage: build
-  image: $UBUNTU_IMAGE
-  script:
-    - export MAKEFLAGS="-j$(nproc)"
-    - NOCONFIGURE=1 ./bootstrap.sh
-    - mkdir build
-    - cd build
-    - ../configure --localstatedir=/var
-    - make
-    - make check
-    - make check-daemon
-    - ulimit -c 0 # don't dump core files on tests that are supposed to assert
-    - make distcheck
-  artifacts:
-    paths:
-      - build/
-
 build-meson:
+  extends: .fdo.distribution-image@ubuntu
   stage: build
-  image: $UBUNTU_IMAGE
   script:
-    # Install meson
-    - wget -q https://github.com/mesonbuild/meson/releases/download/0.50.0/meson-0.50.0.tar.gz
-    - tar -xf meson-0.50.0.tar.gz
-    - cd meson-0.50.0
+    # Install meson (higher than our min version to support our wrap file)
+    - wget -q https://github.com/mesonbuild/meson/releases/download/0.63.2/meson-0.63.2.tar.gz
+    - tar -xf meson-0.63.2.tar.gz
+    - cd meson-0.63.2
     - python3 setup.py install
     - cd ..
     # Do the actual build
-    - meson build
+    - meson build -Dwebrtc-aec=enabled
     - cd build
     - ninja
+    - ulimit -c 0 # don't dump core files on tests that are supposed to assert
     - ninja test
     - ninja test-daemon
+    - ninja dist
   artifacts:
     paths:
       - build/

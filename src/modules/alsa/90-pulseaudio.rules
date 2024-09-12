@@ -19,6 +19,7 @@ SUBSYSTEM!="sound", GOTO="pulseaudio_end"
 ACTION!="change", GOTO="pulseaudio_end"
 KERNEL!="card*", GOTO="pulseaudio_end"
 SUBSYSTEMS=="usb", GOTO="pulseaudio_check_usb"
+SUBSYSTEMS=="pci", GOTO="pulseaudio_check_pci"
 SUBSYSTEMS=="firewire", GOTO="pulseaudio_firewire_quirk"
 
 SUBSYSTEMS=="platform", DRIVERS=="thinkpad_acpi", ENV{PULSE_IGNORE}="1"
@@ -104,12 +105,19 @@ ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="041d", ENV{PULSE_PROFILE_SET}="nativ
 ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1010", ENV{PULSE_PROFILE_SET}="native-instruments-traktor-audio6.conf"
 ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1011", ENV{PULSE_PROFILE_SET}="native-instruments-traktor-audio6.conf"
 
+
+ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1001", ENV{PULSE_PROFILE_SET}="native-instruments-komplete-audio6.conf"
+# This entry is for the Komplete Audio 6 MK2, which has a different ID, but is functionally identical to the Komplete Audio 6.
+ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1870", ENV{PULSE_PROFILE_SET}="native-instruments-komplete-audio6.conf"
 ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1021", ENV{PULSE_PROFILE_SET}="native-instruments-traktor-audio10.conf"
 ATTRS{idVendor}=="0763", ATTRS{idProduct}=="2012", ENV{PULSE_PROFILE_SET}="maudio-fasttrack-pro.conf"
 ATTRS{idVendor}=="045e", ATTRS{idProduct}=="02bb", ENV{PULSE_PROFILE_SET}="kinect-audio.conf"
 ATTRS{idVendor}=="041e", ATTRS{idProduct}=="322c", ENV{PULSE_PROFILE_SET}="sb-omni-surround-5.1.conf"
 ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="4014", ENV{PULSE_PROFILE_SET}="dell-dock-tb16-usb-audio.conf"
-
+ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="402e", ENV{PULSE_PROFILE_SET}="dell-dock-tb16-usb-audio.conf"
+ATTRS{idVendor}=="08bb", ATTRS{idProduct}=="2902", ENV{PULSE_PROFILE_SET}="texas-instruments-pcm2902.conf"
+ATTRS{idVendor}=="03f0", ATTRS{idProduct}=="0269", ENV{PULSE_PROFILE_SET}="hp-tbt-dock-120w-g2.conf"
+ATTRS{idVendor}=="03f0", ATTRS{idProduct}=="0567", ENV{PULSE_PROFILE_SET}="hp-tbt-dock-audio-module.conf"
 
 # ID 1038:12ad is for the 2018 refresh of the Arctis 7.
 # ID 1038:1294 is for Arctis Pro Wireless (which works with the Arctis 7 configuration).
@@ -117,8 +125,17 @@ ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1260", ENV{PULSE_PROFILE_SET}="usb-g
 ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12ad", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
 ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1294", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
 ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1730", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
+# ID 1038:1282 is for SteelSeries GameDAC
+ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1282", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
+# ID 1038:12c4 is for Arctis 9
+ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12c4", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
 # Lucidsound LS31
 ATTRS{idVendor}=="2f12", ATTRS{idProduct}=="0109", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
+# ID 9886:002c is for the Astro A50 Gen4
+ATTRS{idVendor}=="9886", ATTRS{idProduct}=="002c", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
+# ID 1532:0520 is for the Razer Kraken Tournament Edition
+ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0520", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
+
 
 # ID 1038:1250 is for the Arctis 5
 # ID 1037:12aa is for the Arctis 5 2019
@@ -129,17 +146,61 @@ ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1252", ENV{PULSE_PROFILE_SET}="steel
 
 ATTRS{idVendor}=="147a", ATTRS{idProduct}=="e055", ENV{PULSE_PROFILE_SET}="cmedia-high-speed-true-hdaudio.conf"
 
+# HyperX Cloud Orbit S has three modes. Each mode has a separate product ID.
+# ID_SERIAL for this device is the device name + mode repeated three times.
+# ID_SERIAL is used for the ID_ID property, and the ID_ID property is used in
+# the card name in PulseAudio. The resulting card name is too long for the name
+# length limit, so we set a more sensible ID_ID here (the same as the default
+# ID_ID, but without repetition in the serial part).
+ATTRS{idVendor}=="0951", ATTRS{idProduct}=="16ff", ENV{ID_ID}="usb-HyperX_Cloud_Orbit_S_2Ch-$env{ID_USB_INTERFACE_NUM}"
+ATTRS{idVendor}=="0951", ATTRS{idProduct}=="1702", ENV{ID_ID}="usb-HyperX_Cloud_Orbit_S_Hi-Res_2Ch-$env{ID_USB_INTERFACE_NUM}"
+ATTRS{idVendor}=="0951", ATTRS{idProduct}=="1703", ENV{ID_ID}="usb-HyperX_Cloud_Orbit_S_3D_8Ch-$env{ID_USB_INTERFACE_NUM}"
+
+# OnePlus Type-C Bullets (ED117)
+ATTRS{idVendor}=="2a70", ATTRS{idProduct}=="1881", ENV{PULSE_PROFILE_SET}="simple-headphones-mic.conf"
+
+# ID 1395:005e is for Sennheiser GSX 1000
+# ID 1395:00a0 is for Sennheiser GSX 1000
+# ID 1395:005f is for Sennheiser GSX 1200
+# ID 1395:00a1 is for Sennheiser GSX 1200
+ATTRS{idVendor}=="1395", ATTRS{idProduct}=="005e", ENV{PULSE_PROFILE_SET}="sennheiser-gsx.conf"
+ATTRS{idVendor}=="1395", ATTRS{idProduct}=="00a0", ENV{PULSE_PROFILE_SET}="sennheiser-gsx.conf"
+ATTRS{idVendor}=="1395", ATTRS{idProduct}=="005f", ENV{PULSE_PROFILE_SET}="sennheiser-gsx.conf"
+ATTRS{idVendor}=="1395", ATTRS{idProduct}=="00a1", ENV{PULSE_PROFILE_SET}="sennheiser-gsx.conf"
+
+# Sennheiser GSA 70 wireless USB dongle for GSP 670
+ATTRS{idVendor}=="1395", ATTRS{idProduct}=="0089", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
+# EPOS GSA 70 wireless USB dongle for GSP 670 (Sennheiser GSA 70 with updated firmware)
+ATTRS{idVendor}=="1395", ATTRS{idProduct}=="0300", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
+# Sennheiser GSP 670 USB headset
+ATTRS{idVendor}=="1395", ATTRS{idProduct}=="008a", ENV{PULSE_PROFILE_SET}="usb-gaming-headset.conf"
+
+# Asus Xonar SE
+ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="189d", ENV{PULSE_PROFILE_SET}="asus-xonar-se.conf"
+
+GOTO="pulseaudio_end"
+
+LABEL="pulseaudio_check_pci"
+
+# Creative SoundBlaster Audigy-based cards
+# EMU10k2/CA0100/CA0102/CA10200
+ATTRS{vendor}=="0x1102", ATTRS{device}=="0x0004", ENV{PULSE_PROFILE_SET}="audigy.conf"
+# CA0108/CA10300
+ATTRS{vendor}=="0x1102", ATTRS{device}=="0x0008", ENV{PULSE_PROFILE_SET}="audigy.conf"
+
 GOTO="pulseaudio_end"
 
 LABEL="pulseaudio_firewire_quirk"
 
-# Focusrite Saffire Pro 10/26 i/o has a quirk to disappear from IEEE 1394 bus when losing connections.
-# https://bugzilla.kernel.org/show_bug.cgi?id=199365
-ENV{ID_VENDOR_ID}=="0x00130e", ENV{ID_MODEL_ID}=="0x000003", ENV{PULSE_IGNORE}="1"
-# Both of Saffire Pro 10 i/o and Liquid Saffire 56 have the same ID_MODEL_ID
-# (0x000006), but Liquid Saffire 56 doesn't suffer from the problem, so we
-# can't use ID_MODEL_ID to identify the problematic card. ID_MODEL works
-# better here.
-ENV{ID_VENDOR_ID}=="0x00130e", ENV{ID_MODEL}=="Pro10IO" ENV{PULSE_IGNORE}="1"
+# Focusrite Saffire Pro 10 i/o and Pro 26 i/o have a quirk to disappear from
+# IEEE 1394 bus when breaking connections. This brings an issue for PulseAudio
+# to continue the routine for ever that:
+# - detecting sound card
+# - starting PCM substream
+# - stopping the PCM substream
+# - the card disappears
+# - the card appears
+# In detail, see: https://bugzilla.kernel.org/show_bug.cgi?id=199365
+ATTRS{vendor}=="0x00130e", ATTRS{model}=="0x00000[36]", ATTRS{units}=="0x00a02d:0x010001", ENV{PULSE_IGNORE}="1"
 
 LABEL="pulseaudio_end"

@@ -32,6 +32,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
+#include <gst/base/gstadapter.h>
 #include <gst/rtp/gstrtpbuffer.h>
 
 #define MAKE_ELEMENT_NAMED(v, e, n)                     \
@@ -42,6 +43,15 @@
     }
 
 #define MAKE_ELEMENT(v, e) MAKE_ELEMENT_NAMED((v), (e), NULL)
+#define RTP_HEADER_SIZE    12
+
+/*
+ * As per RFC 7587, the RTP payload type for OPUS is to be assigned
+ * dynamically. Considering that pa_rtp_payload_from_sample_spec uses
+ * 127 for anything other than format == S16BE and rate == 44.1 KHz,
+ * we use 127 for OPUS here as rate == 48 KHz for OPUS.
+ */
+#define RTP_OPUS_PAYLOAD_TYPE 127
 
 struct pa_rtp_context {
     pa_fdsem *fdsem;
@@ -50,23 +60,30 @@ struct pa_rtp_context {
     GstElement *pipeline;
     GstElement *appsrc;
     GstElement *appsink;
+    GstCaps *meta_reference;
 
+    bool first_buffer;
     uint32_t last_timestamp;
+
+    uint8_t *send_buf;
+    size_t mtu;
 };
 
-static GstCaps* caps_from_sample_spec(const pa_sample_spec *ss) {
-    if (ss->format != PA_SAMPLE_S16BE)
+static GstCaps* caps_from_sample_spec(const pa_sample_spec *ss, bool enable_opus) {
+    if (ss->format != PA_SAMPLE_S16BE && ss->format != PA_SAMPLE_S16LE)
         return NULL;
 
     return gst_caps_new_simple("audio/x-raw",
-            "format", G_TYPE_STRING, "S16BE",
+            "format", G_TYPE_STRING, enable_opus ? "S16LE" : "S16BE",
             "rate", G_TYPE_INT, (int) ss->rate,
             "channels", G_TYPE_INT, (int) ss->channels,
             "layout", G_TYPE_STRING, "interleaved",
             NULL);
 }
-static bool init_send_pipeline(pa_rtp_context *c, int fd, uint8_t payload, size_t mtu, const pa_sample_spec *ss) {
+
+static bool init_send_pipeline(pa_rtp_context *c, int fd, uint8_t payload, size_t mtu, const pa_sample_spec *ss, bool enable_opus) {
     GstElement *appsrc = NULL, *pay = NULL, *capsf = NULL, *rtpbin = NULL, *sink = NULL;
+    GstElement *opusenc = NULL;
     GstCaps *caps;
     GSocket *socket;
     GInetSocketAddress *addr;
@@ -75,7 +92,12 @@ static bool init_send_pipeline(pa_rtp_context *c, int fd, uint8_t payload, size_
     gchar *addr_str;
 
     MAKE_ELEMENT(appsrc, "appsrc");
-    MAKE_ELEMENT(pay, "rtpL16pay");
+    if (enable_opus) {
+        MAKE_ELEMENT(opusenc, "opusenc");
+        MAKE_ELEMENT(pay, "rtpopuspay");
+    } else {
+        MAKE_ELEMENT(pay, "rtpL16pay");
+    }
     MAKE_ELEMENT(capsf, "capsfilter");
     MAKE_ELEMENT(rtpbin, "rtpbin");
     MAKE_ELEMENT(sink, "udpsink");
@@ -84,7 +106,10 @@ static bool init_send_pipeline(pa_rtp_context *c, int fd, uint8_t payload, size_
 
     gst_bin_add_many(GST_BIN(c->pipeline), appsrc, pay, capsf, rtpbin, sink, NULL);
 
-    caps = caps_from_sample_spec(ss);
+    if (enable_opus)
+        gst_bin_add_many(GST_BIN(c->pipeline), opusenc, NULL);
+
+    caps = caps_from_sample_spec(ss, enable_opus);
     if (!caps) {
         pa_log("Unsupported format to payload");
         goto fail;
@@ -117,17 +142,33 @@ static bool init_send_pipeline(pa_rtp_context *c, int fd, uint8_t payload, size_
     gst_caps_unref(caps);
 
     /* Force the payload type that we want */
-    caps = gst_caps_new_simple("application/x-rtp", "payload", G_TYPE_INT, (int) payload, NULL);
+    if (enable_opus)
+        caps = gst_caps_new_simple("application/x-rtp", "payload", G_TYPE_INT, (int) RTP_OPUS_PAYLOAD_TYPE, "encoding-name", G_TYPE_STRING, "OPUS", NULL);
+    else
+        caps = gst_caps_new_simple("application/x-rtp", "payload", G_TYPE_INT, (int) payload, "encoding-name", G_TYPE_STRING, "L16", NULL);
+
     g_object_set(capsf, "caps", caps, NULL);
     gst_caps_unref(caps);
 
-    if (!gst_element_link(appsrc, pay) ||
-        !gst_element_link(pay, capsf) ||
-        !gst_element_link_pads(capsf, "src", rtpbin, "send_rtp_sink_0") ||
-        !gst_element_link_pads(rtpbin, "send_rtp_src_0", sink, "sink")) {
+    if (enable_opus) {
+        if (!gst_element_link(appsrc, opusenc) ||
+            !gst_element_link(opusenc, pay) ||
+            !gst_element_link(pay, capsf) ||
+            !gst_element_link_pads(capsf, "src", rtpbin, "send_rtp_sink_0") ||
+            !gst_element_link_pads(rtpbin, "send_rtp_src_0", sink, "sink")) {
 
-        pa_log("Could not set up send pipeline");
-        goto fail;
+            pa_log("Could not set up send pipeline");
+            goto fail;
+        }
+    } else {
+        if (!gst_element_link(appsrc, pay) ||
+            !gst_element_link(pay, capsf) ||
+            !gst_element_link_pads(capsf, "src", rtpbin, "send_rtp_sink_0") ||
+            !gst_element_link_pads(rtpbin, "send_rtp_src_0", sink, "sink")) {
+
+            pa_log("Could not set up send pipeline");
+            goto fail;
+        }
     }
 
     if (gst_element_set_state(c->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
@@ -146,6 +187,8 @@ fail:
         /* These weren't yet added to pipeline, so we still have a ref */
         if (appsrc)
             gst_object_unref(appsrc);
+        if (opusenc)
+            gst_object_unref(opusenc);
         if (pay)
             gst_object_unref(pay);
         if (capsf)
@@ -159,7 +202,7 @@ fail:
     return false;
 }
 
-pa_rtp_context* pa_rtp_context_new_send(int fd, uint8_t payload, size_t mtu, const pa_sample_spec *ss) {
+pa_rtp_context* pa_rtp_context_new_send(int fd, uint8_t payload, size_t mtu, const pa_sample_spec *ss, bool enable_opus) {
     pa_rtp_context *c = NULL;
     GError *error = NULL;
 
@@ -167,9 +210,14 @@ pa_rtp_context* pa_rtp_context_new_send(int fd, uint8_t payload, size_t mtu, con
 
     pa_log_info("Initialising GStreamer RTP backend for send");
 
+    if (enable_opus)
+        pa_log_info("Using OPUS encoding for RTP send");
+
     c = pa_xnew0(pa_rtp_context, 1);
 
     c->ss = *ss;
+    c->mtu = mtu - RTP_HEADER_SIZE;
+    c->send_buf = pa_xmalloc(c->mtu);
 
     if (!gst_init_check(NULL, NULL, &error)) {
         pa_log_error("Could not initialise GStreamer: %s", error->message);
@@ -177,7 +225,7 @@ pa_rtp_context* pa_rtp_context_new_send(int fd, uint8_t payload, size_t mtu, con
         goto fail;
     }
 
-    if (!init_send_pipeline(c, fd, payload, mtu, ss))
+    if (!init_send_pipeline(c, fd, payload, mtu, ss, enable_opus))
         goto fail;
 
     return c;
@@ -215,18 +263,10 @@ static bool process_bus_messages(pa_rtp_context *c) {
     return ret;
 }
 
-static void free_buffer(pa_memblock *memblock) {
-    pa_memblock_release(memblock);
-    pa_memblock_unref(memblock);
-}
-
 /* Called from I/O thread context */
 int pa_rtp_send(pa_rtp_context *c, pa_memblockq *q) {
-    pa_memchunk chunk = { 0, };
     GstBuffer *buf;
-    void *data;
-    bool stop = false;
-    int ret = 0;
+    size_t n = 0;
 
     pa_assert(c);
     pa_assert(q);
@@ -234,45 +274,94 @@ int pa_rtp_send(pa_rtp_context *c, pa_memblockq *q) {
     if (!process_bus_messages(c))
         return -1;
 
-    while (!stop && pa_memblockq_peek(q, &chunk) == 0) {
-        GstClock *clock;
-        GstClockTime timestamp, clock_time;
+    /*
+     * While we check here for atleast MTU worth of data being available in
+     * memblockq, we might not have exact equivalent to MTU. Hence, we walk
+     * over the memchunks in memblockq and accumulate MTU bytes next.
+     */
+    if (pa_memblockq_get_length(q) < c->mtu)
+        return 0;
 
-        clock = gst_element_get_clock(c->pipeline);
-        clock_time = gst_clock_get_time(clock);
-        gst_object_unref(clock);
+    for (;;) {
+        pa_memchunk chunk;
+        int r;
 
-        timestamp = gst_element_get_base_time(c->pipeline);
-        if (timestamp > clock_time)
-          timestamp -= clock_time;
-        else
-          timestamp = 0;
+        pa_memchunk_reset(&chunk);
 
-        pa_assert(chunk.memblock);
+        if ((r = pa_memblockq_peek(q, &chunk)) >= 0) {
+            /*
+             * Accumulate MTU bytes of data before sending. If the current
+             * chunk length + accumulated bytes exceeds MTU, we drop bytes
+             * considered for transfer in this iteration from memblockq.
+             *
+             * The remaining bytes will be available in the next iteration,
+             * as these will be tracked and maintained by memblockq.
+             */
+            size_t k = n + chunk.length > c->mtu ? c->mtu - n : chunk.length;
 
-        data = pa_memblock_acquire(chunk.memblock);
+            pa_assert(chunk.memblock);
 
-        buf = gst_buffer_new_wrapped_full(GST_MEMORY_FLAG_READONLY | GST_MEMORY_FLAG_PHYSICALLY_CONTIGUOUS,
-                                          data, chunk.length, chunk.index, chunk.length, chunk.memblock,
-                                          (GDestroyNotify) free_buffer);
+            memcpy(c->send_buf + n, pa_memblock_acquire_chunk(&chunk), k);
+            pa_memblock_release(chunk.memblock);
+            pa_memblock_unref(chunk.memblock);
 
-        GST_BUFFER_PTS(buf) = timestamp;
-
-        if (gst_app_src_push_buffer(GST_APP_SRC(c->appsrc), buf) != GST_FLOW_OK) {
-            pa_log_error("Could not push buffer");
-            stop = true;
-            ret = -1;
+            n += k;
+            pa_memblockq_drop(q, k);
         }
 
-        pa_memblockq_drop(q, chunk.length);
+        if (r < 0 || n >= c->mtu) {
+            GstClock *clock;
+            GstClockTime timestamp, clock_time;
+            GstMapInfo info;
+
+            if (n > 0) {
+                clock = gst_element_get_clock(c->pipeline);
+                clock_time = gst_clock_get_time(clock);
+                gst_object_unref(clock);
+
+                timestamp = gst_element_get_base_time(c->pipeline);
+                if (timestamp > clock_time)
+                  timestamp -= clock_time;
+                else
+                  timestamp = 0;
+
+                buf = gst_buffer_new_allocate(NULL, n, NULL);
+                pa_assert(buf);
+
+                GST_BUFFER_PTS(buf) = timestamp;
+
+                pa_assert_se(gst_buffer_map(buf, &info, GST_MAP_WRITE));
+
+                memcpy(info.data, c->send_buf, n);
+                gst_buffer_unmap(buf, &info);
+
+                if (gst_app_src_push_buffer(GST_APP_SRC(c->appsrc), buf) != GST_FLOW_OK) {
+                    pa_log_error("Could not push buffer");
+                    return -1;
+                }
+            }
+
+            if (r < 0 || pa_memblockq_get_length(q) < c->mtu)
+                break;
+
+            n = 0;
+        }
     }
 
-    return ret;
+    return 0;
 }
 
-static GstCaps* rtp_caps_from_sample_spec(const pa_sample_spec *ss) {
-    if (ss->format != PA_SAMPLE_S16BE)
+static GstCaps* rtp_caps_from_sample_spec(const pa_sample_spec *ss, bool enable_opus) {
+    if (ss->format != PA_SAMPLE_S16BE && ss->format != PA_SAMPLE_S16LE)
         return NULL;
+
+    if (enable_opus)
+        return gst_caps_new_simple("application/x-rtp",
+                "media", G_TYPE_STRING, "audio",
+                "encoding-name", G_TYPE_STRING, "OPUS",
+                "clock-rate", G_TYPE_INT, (int) 48000,
+                "payload", G_TYPE_INT, (int) RTP_OPUS_PAYLOAD_TYPE,
+                NULL);
 
     return gst_caps_new_simple("application/x-rtp",
             "media", G_TYPE_STRING, "audio",
@@ -314,20 +403,47 @@ static void on_pad_added(GstElement *element, GstPad *pad, gpointer userdata) {
     gst_object_unref(depay);
 }
 
-static bool init_receive_pipeline(pa_rtp_context *c, int fd, const pa_sample_spec *ss) {
+static GstPadProbeReturn udpsrc_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer userdata) {
+    struct timeval tv;
+    pa_usec_t timestamp;
+    pa_rtp_context *c = (pa_rtp_context *) userdata;
+
+    pa_assert(info->type & GST_PAD_PROBE_TYPE_BUFFER);
+
+    pa_gettimeofday(&tv);
+    timestamp = pa_timeval_load(&tv);
+
+    gst_buffer_add_reference_timestamp_meta(GST_BUFFER(info->data), c->meta_reference, timestamp * GST_USECOND,
+            GST_CLOCK_TIME_NONE);
+
+    return GST_PAD_PROBE_OK;
+}
+
+static bool init_receive_pipeline(pa_rtp_context *c, int fd, const pa_sample_spec *ss, bool enable_opus) {
     GstElement *udpsrc = NULL, *rtpbin = NULL, *depay = NULL, *appsink = NULL;
-    GstCaps *caps;
+    GstElement *resample = NULL, *opusdec = NULL;
+    GstCaps *caps, *sink_caps;
+    GstPad *pad;
     GSocket *socket;
     GError *error = NULL;
 
     MAKE_ELEMENT(udpsrc, "udpsrc");
     MAKE_ELEMENT(rtpbin, "rtpbin");
-    MAKE_ELEMENT_NAMED(depay, "rtpL16depay", "depay");
+    if (enable_opus) {
+        MAKE_ELEMENT_NAMED(depay, "rtpopusdepay", "depay");
+        MAKE_ELEMENT(opusdec, "opusdec");
+        MAKE_ELEMENT(resample, "audioresample");
+    } else {
+        MAKE_ELEMENT_NAMED(depay, "rtpL16depay", "depay");
+    }
     MAKE_ELEMENT(appsink, "appsink");
 
     c->pipeline = gst_pipeline_new(NULL);
 
     gst_bin_add_many(GST_BIN(c->pipeline), udpsrc, rtpbin, depay, appsink, NULL);
+
+    if (enable_opus)
+        gst_bin_add_many(GST_BIN(c->pipeline), opusdec, resample, NULL);
 
     socket = g_socket_new_from_fd(fd, &error);
     if (error) {
@@ -336,7 +452,7 @@ static bool init_receive_pipeline(pa_rtp_context *c, int fd, const pa_sample_spe
         goto fail;
     }
 
-    caps = rtp_caps_from_sample_spec(ss);
+    caps = rtp_caps_from_sample_spec(ss, enable_opus);
     if (!caps) {
         pa_log("Unsupported format to payload");
         goto fail;
@@ -346,17 +462,48 @@ static bool init_receive_pipeline(pa_rtp_context *c, int fd, const pa_sample_spe
     g_object_set(rtpbin, "latency", 0, "buffer-mode", 0 /* none */, NULL);
     g_object_set(appsink, "sync", FALSE, "enable-last-sample", FALSE, NULL);
 
+    if (enable_opus) {
+        sink_caps = gst_caps_new_simple("audio/x-raw",
+                "format", G_TYPE_STRING, "S16LE",
+                "layout", G_TYPE_STRING, "interleaved",
+                "clock-rate", G_TYPE_INT, (int) ss->rate,
+                "channels", G_TYPE_INT, (int) ss->channels,
+                NULL);
+        g_object_set(appsink, "caps", sink_caps, NULL);
+        g_object_set(opusdec, "plc", TRUE, NULL);
+        gst_caps_unref(sink_caps);
+    }
+
     gst_caps_unref(caps);
     g_object_unref(socket);
 
-    if (!gst_element_link_pads(udpsrc, "src", rtpbin, "recv_rtp_sink_0") ||
-        !gst_element_link(depay, appsink)) {
+    if (enable_opus) {
+        if (!gst_element_link_pads(udpsrc, "src", rtpbin, "recv_rtp_sink_0") ||
+            !gst_element_link(depay, opusdec) ||
+            !gst_element_link(opusdec, resample) ||
+            !gst_element_link(resample, appsink)) {
 
-        pa_log("Could not set up receive pipeline");
-        goto fail;
+            pa_log("Could not set up receive pipeline");
+            goto fail;
+        }
+    } else {
+        if (!gst_element_link_pads(udpsrc, "src", rtpbin, "recv_rtp_sink_0") ||
+            !gst_element_link(depay, appsink)) {
+
+            pa_log("Could not set up receive pipeline");
+            goto fail;
+        }
     }
 
     g_signal_connect(G_OBJECT(rtpbin), "pad-added", G_CALLBACK(on_pad_added), c);
+
+    /* This logic should go into udpsrc, and we should be populating the
+     * receive timestamp using SCM_TIMESTAMP, but until we have that ... */
+    c->meta_reference = gst_caps_new_empty_simple("timestamp/x-pulseaudio-wallclock");
+
+    pad = gst_element_get_static_pad(udpsrc, "src");
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, udpsrc_buffer_probe, c, NULL);
+    gst_object_unref(pad);
 
     if (gst_element_set_state(c->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
         pa_log("Could not start pipeline");
@@ -378,6 +525,10 @@ fail:
             gst_object_unref(depay);
         if (rtpbin)
             gst_object_unref(rtpbin);
+        if (opusdec)
+            gst_object_unref(opusdec);
+        if (resample)
+            gst_object_unref(resample);
         if (appsink)
             gst_object_unref(appsink);
     }
@@ -401,7 +552,7 @@ static GstFlowReturn appsink_new_sample(GstAppSink *appsink, gpointer userdata) 
     return GST_FLOW_OK;
 }
 
-pa_rtp_context* pa_rtp_context_new_recv(int fd, uint8_t payload, const pa_sample_spec *ss) {
+pa_rtp_context* pa_rtp_context_new_recv(int fd, uint8_t payload, const pa_sample_spec *ss, bool enable_opus) {
     pa_rtp_context *c = NULL;
     GstAppSinkCallbacks callbacks = { 0, };
     GError *error = NULL;
@@ -410,10 +561,15 @@ pa_rtp_context* pa_rtp_context_new_recv(int fd, uint8_t payload, const pa_sample
 
     pa_log_info("Initialising GStreamer RTP backend for receive");
 
+    if (enable_opus)
+        pa_log_info("Using OPUS encoding for RTP recv");
+
     c = pa_xnew0(pa_rtp_context, 1);
 
     c->fdsem = pa_fdsem_new();
     c->ss = *ss;
+    c->send_buf = NULL;
+    c->first_buffer = true;
 
     if (!gst_init_check(NULL, NULL, &error)) {
         pa_log_error("Could not initialise GStreamer: %s", error->message);
@@ -421,7 +577,7 @@ pa_rtp_context* pa_rtp_context_new_recv(int fd, uint8_t payload, const pa_sample
         goto fail;
     }
 
-    if (!init_receive_pipeline(c, fd, ss))
+    if (!init_receive_pipeline(c, fd, ss, enable_opus))
         goto fail;
 
     callbacks.eos = appsink_eos;
@@ -438,54 +594,121 @@ fail:
 /* Called from I/O thread context */
 int pa_rtp_recv(pa_rtp_context *c, pa_memchunk *chunk, pa_mempool *pool, uint32_t *rtp_tstamp, struct timeval *tstamp) {
     GstSample *sample = NULL;
+    GstBufferList *buf_list;
+    GstAdapter *adapter = NULL;
     GstBuffer *buf;
     GstMapInfo info;
-    void *data;
+    GstClockTime timestamp = GST_CLOCK_TIME_NONE;
+    uint8_t *data;
+    uint64_t data_len = 0;
 
     if (!process_bus_messages(c))
         goto fail;
 
-    sample = gst_app_sink_pull_sample(GST_APP_SINK(c->appsink));
-    if (!sample) {
-        pa_log_warn("Could not get any more data");
-        goto fail;
+    adapter = gst_adapter_new();
+    pa_assert(adapter);
+
+    while (true) {
+        sample = gst_app_sink_try_pull_sample(GST_APP_SINK(c->appsink), 0);
+        if (!sample)
+            break;
+
+        buf = gst_sample_get_buffer(sample);
+
+        /* Get the timestamp from the first buffer */
+        if (timestamp == GST_CLOCK_TIME_NONE) {
+            GstReferenceTimestampMeta *meta = gst_buffer_get_reference_timestamp_meta(buf, c->meta_reference);
+
+            /* Use the meta if we were able to insert it and it came through,
+             * else try to fallback to the DTS, which is only available in
+             * GStreamer 1.16 and earlier. */
+            if (meta)
+                timestamp = meta->timestamp;
+            else if (GST_BUFFER_DTS(buf) != GST_CLOCK_TIME_NONE)
+                timestamp = GST_BUFFER_DTS(buf);
+            else
+                timestamp = 0;
+        }
+
+        if (GST_BUFFER_IS_DISCONT(buf))
+            pa_log_info("Discontinuity detected, possibly lost some packets");
+
+        if (!gst_buffer_map(buf, &info, GST_MAP_READ)) {
+            pa_log_info("Failed to map buffer");
+            gst_sample_unref(sample);
+            goto fail;
+        }
+
+        data_len += info.size;
+        /* We need the buffer to be valid longer than the sample, which will
+         * be valid only for the duration of this loop.
+         *
+         * To do this, increase the ref count. Ownership is transferred to the
+         * adapter in gst_adapter_push.
+         */
+        gst_buffer_ref(buf);
+        gst_adapter_push(adapter, buf);
+        gst_buffer_unmap(buf, &info);
+
+        gst_sample_unref(sample);
     }
 
-    buf = gst_sample_get_buffer(sample);
+    buf_list = gst_adapter_take_buffer_list(adapter, data_len);
+    pa_assert(buf_list);
 
-    if (GST_BUFFER_IS_DISCONT(buf))
-        pa_log_info("Discontinuity detected, possibly lost some packets");
+    pa_assert(pa_mempool_block_size_max(pool) >= data_len);
 
-    if (!gst_buffer_map(buf, &info, GST_MAP_READ))
-        goto fail;
-
-    pa_assert(pa_mempool_block_size_max(pool) >= info.size);
-
-    chunk->memblock = pa_memblock_new(pool, info.size);
+    chunk->memblock = pa_memblock_new(pool, data_len);
     chunk->index = 0;
-    chunk->length = info.size;
+    chunk->length = data_len;
 
-    data = pa_memblock_acquire_chunk(chunk);
-    /* TODO: we could probably just provide an allocator and avoid a memcpy */
-    memcpy(data, info.data, info.size);
+    data = (uint8_t *) pa_memblock_acquire_chunk(chunk);
+
+    for (int i = 0; i < gst_buffer_list_length(buf_list); i++) {
+        buf = gst_buffer_list_get(buf_list, i);
+
+        if (!gst_buffer_map(buf, &info, GST_MAP_READ)) {
+            gst_buffer_list_unref(buf_list);
+            goto fail;
+        }
+
+        memcpy(data, info.data, info.size);
+        data += info.size;
+        gst_buffer_unmap(buf, &info);
+    }
+
     pa_memblock_release(chunk->memblock);
 
     /* When buffer-mode = none, the buffer PTS is the RTP timestamp, converted
      * to time units (instead of clock-rate units as is in the header) and
-     * wraparound-corrected, and the DTS is the pipeline clock timestamp from
-     * when the buffer was acquired at the source (this is actually the running
-     * time which is why we need to add base time). */
-    *rtp_tstamp = gst_util_uint64_scale_int(GST_BUFFER_PTS(buf), c->ss.rate, GST_SECOND) & 0xFFFFFFFFU;
-    pa_timeval_rtstore(tstamp, (GST_BUFFER_DTS(buf) + gst_element_get_base_time(c->pipeline)) / GST_USECOND, false);
+     * wraparound-corrected. */
+    *rtp_tstamp = gst_util_uint64_scale_int(GST_BUFFER_PTS(gst_buffer_list_get(buf_list, 0)), c->ss.rate, GST_SECOND) & 0xFFFFFFFFU;
+    if (timestamp != GST_CLOCK_TIME_NONE)
+        pa_timeval_rtstore(tstamp, timestamp / PA_NSEC_PER_USEC, false);
 
-    gst_buffer_unmap(buf, &info);
-    gst_sample_unref(sample);
+    if (c->first_buffer) {
+        c->first_buffer = false;
+        c->last_timestamp = *rtp_tstamp;
+    } else {
+        /* The RTP clock -> time domain -> RTP clock transformation above might
+         * add a ±1 rounding error, so let's get rid of that */
+        uint32_t expected = c->last_timestamp + (uint32_t) (data_len / pa_rtp_context_get_frame_size(c));
+        int delta = *rtp_tstamp - expected;
+
+        if (delta == 1 || delta == -1)
+            *rtp_tstamp -= delta;
+
+        c->last_timestamp = *rtp_tstamp;
+    }
+
+    gst_buffer_list_unref(buf_list);
+    gst_object_unref(adapter);
 
     return 0;
 
 fail:
-    if (sample)
-        gst_sample_unref(sample);
+    if (adapter)
+        gst_object_unref(adapter);
 
     if (chunk->memblock)
         pa_memblock_unref(chunk->memblock);
@@ -496,9 +719,13 @@ fail:
 void pa_rtp_context_free(pa_rtp_context *c) {
     pa_assert(c);
 
+    if (c->meta_reference)
+        gst_caps_unref(c->meta_reference);
+
     if (c->appsrc) {
         gst_app_src_end_of_stream(GST_APP_SRC(c->appsrc));
         gst_object_unref(c->appsrc);
+        pa_xfree(c->send_buf);
     }
 
     if (c->appsink)

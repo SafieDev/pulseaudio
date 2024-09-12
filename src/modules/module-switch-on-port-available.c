@@ -71,6 +71,9 @@ static bool profile_good_for_output(pa_card_profile *profile, pa_device_port *po
 
     card = profile->card;
 
+    if (pa_safe_streq(card->active_profile->name, "off"))
+        return true;
+
     if (!pa_safe_streq(card->active_profile->input_name, profile->input_name))
         return false;
 
@@ -103,6 +106,9 @@ static bool profile_good_for_input(pa_card_profile *profile, pa_device_port *por
 
     card = profile->card;
 
+    if (pa_safe_streq(card->active_profile->name, "off"))
+        return true;
+
     if (!pa_safe_streq(card->active_profile->output_name, profile->output_name))
         return false;
 
@@ -130,6 +136,11 @@ static int try_to_switch_profile(pa_device_port *port) {
     pa_card_profile *best_profile = NULL, *profile;
     void *state;
     unsigned best_prio = 0;
+
+    if (port->card->profile_is_sticky) {
+        pa_log_info("Keeping sticky card profile '%s'", port->card->active_profile->name);
+        return -1;
+    }
 
     pa_log_debug("Finding best profile for port %s, preferred = %s",
                  port->name, pa_strnull(port->preferred_profile));
@@ -228,9 +239,7 @@ static struct port_pointers find_port_pointers(pa_device_port *port) {
 }
 
 /* Switches to a port, switching profiles if necessary or preferred */
-static void switch_to_port(pa_device_port *port) {
-    struct port_pointers pp = find_port_pointers(port);
-
+static void switch_to_port(pa_device_port *port, struct port_pointers pp) {
     if (pp.is_port_active)
         return; /* Already selected */
 
@@ -252,8 +261,7 @@ static void switch_to_port(pa_device_port *port) {
 }
 
 /* Switches away from a port, switching profiles if necessary or preferred */
-static void switch_from_port(pa_device_port *port) {
-    struct port_pointers pp = find_port_pointers(port);
+static void switch_from_port(pa_device_port *port, struct port_pointers pp) {
     pa_device_port *p, *best_port = NULL;
     void *state;
 
@@ -281,13 +289,15 @@ static void switch_from_port(pa_device_port *port) {
      * profile is still available in the
      * PA_CORE_HOOK_CARD_PROFILE_AVAILABLE_CHANGED callback, as at this point
      * the profile availability hasn't been updated yet. */
-    if (best_port)
-        switch_to_port(best_port);
+    if (best_port) {
+        struct port_pointers best_pp = find_port_pointers(best_port);
+        switch_to_port(best_port, best_pp);
+    }
 }
 
 
 static pa_hook_result_t port_available_hook_callback(pa_core *c, pa_device_port *port, void* userdata) {
-    pa_assert(port);
+    struct port_pointers pp = find_port_pointers(port);
 
     if (!port->card) {
         pa_log_warn("Port %s does not have a card", port->name);
@@ -303,11 +313,51 @@ static pa_hook_result_t port_available_hook_callback(pa_core *c, pa_device_port 
         return PA_HOOK_OK;
 
     switch (port->available) {
+    case PA_AVAILABLE_UNKNOWN:
+        /* If a port availability became unknown, let's see if it's part of
+         * some availability group. If it is, it is likely to be a headphone
+         * jack that does not have impedance sensing to detect whether what was
+         * plugged in was a headphone, headset or microphone. In desktop
+         * environments that support it, this will trigger a user choice to
+         * select what kind of device was plugged in. However, let's switch to
+         * the headphone port at least, so that we have don't break
+         * functionality for setups that can't trigger this kind of
+         * interaction.
+         *
+         * For headset or microphone, if they are part of some availability group
+         * and they become unknown from off, it needs to check if their source is
+         * unlinked or not, if their source is unlinked, let switch_to_port()
+         * process them, then with the running of pa_card_set_profile(), their
+         * source will be created, otherwise the headset or microphone can't be used
+         * to record sound since there is no source for these 2 ports. This issue
+         * is observed on Dell machines which have multi-function audio jack but no
+         * internal mic.
+         *
+         * We should make this configurable so that users can optionally
+         * override the default to a headset or mic. */
+
+        /* Not part of a group of ports, so likely not a combination port */
+        if (!port->availability_group) {
+            pa_log_debug("Not switching to port %s, its availability is unknown and it's not in any availability group.", port->name);
+            break;
+        }
+
+        /* Switch the headphone port, the input ports without source and the
+         * input ports their source->active_port is part of a group of ports.
+         */
+        if (port->direction == PA_DIRECTION_INPUT && pp.source && !pp.source->active_port->availability_group) {
+            pa_log_debug("Not switching to input port %s, its availability is unknown.", port->name);
+            break;
+        }
+
+        switch_to_port(port, pp);
+        break;
+
     case PA_AVAILABLE_YES:
-        switch_to_port(port);
+        switch_to_port(port, pp);
         break;
     case PA_AVAILABLE_NO:
-        switch_from_port(port);
+        switch_from_port(port, pp);
         break;
     default:
         break;
@@ -345,6 +395,11 @@ static pa_hook_result_t card_profile_available_hook_callback(pa_core *c, pa_card
 
     if (!pa_streq(profile->name, card->active_profile->name))
         return PA_HOOK_OK;
+
+    if (card->profile_is_sticky) {
+        pa_log_info("Keeping sticky card profile '%s'", profile->name);
+        return PA_HOOK_OK;
+    }
 
     pa_log_debug("Active profile %s on card %s became unavailable, switching to another profile", profile->name, card->name);
     pa_card_set_profile(card, find_best_profile(card), false);

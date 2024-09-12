@@ -29,6 +29,7 @@
 #include <pulse/xmalloc.h>
 #include <pulse/util.h>
 #include <pulse/internal.h>
+#include <pulse/timeval.h>
 
 #include <pulsecore/core-format.h>
 #include <pulsecore/mix.h>
@@ -237,6 +238,7 @@ int pa_source_output_new(
     pa_channel_map volume_map;
     int r;
     char *pt;
+    size_t resampler_history;
 
     pa_assert(_o);
     pa_assert(core);
@@ -498,6 +500,11 @@ int pa_source_output_new(
             1,
             0,
             &o->source->silence);
+
+    resampler_history = (uint64_t) PA_RESAMPLER_MAX_DELAY_USEC * o->source->sample_spec.rate / PA_USEC_PER_SEC;
+    resampler_history *= pa_frame_size(&o->source->sample_spec);
+
+    pa_memblockq_set_maxrewind(o->thread_info.delay_memblockq, resampler_history + pa_source_get_max_rewind(o->source));
 
     pa_assert_se(pa_idxset_put(core->source_outputs, o, &o->index) == 0);
     pa_assert_se(pa_idxset_put(o->source->outputs, pa_source_output_ref(o), NULL) == 0);
@@ -865,21 +872,36 @@ void pa_source_output_process_rewind(pa_source_output *o, size_t nbytes /* in so
         return;
 
     if (o->process_rewind) {
-        pa_assert(pa_memblockq_get_length(o->thread_info.delay_memblockq) == 0);
+        size_t source_output_nbytes;
+        size_t length;
 
-        if (o->thread_info.resampler)
-            nbytes = pa_resampler_result(o->thread_info.resampler, nbytes);
+        /* The length of the memblockq may be non-zero if pa_source_output_rewind() is called twice
+         * without pa_source_output_push() called in between. In that case, the resampler has already
+         * been reset and we can skip that part. */
+        length = pa_memblockq_get_length(o->thread_info.delay_memblockq);
 
-        pa_log_debug("Have to rewind %lu bytes on implementor.", (unsigned long) nbytes);
+        pa_memblockq_rewind(o->thread_info.delay_memblockq, nbytes);
 
-        if (nbytes > 0)
-            o->process_rewind(o, nbytes);
+        source_output_nbytes = pa_resampler_result(o->thread_info.resampler, nbytes);
 
-        if (o->thread_info.resampler)
-            pa_resampler_rewind(o->thread_info.resampler, nbytes);
+        pa_log_debug("Have to rewind %lu bytes on implementor.", (unsigned long) source_output_nbytes);
 
-    } else
-        pa_memblockq_seek(o->thread_info.delay_memblockq, - ((int64_t) nbytes), PA_SEEK_RELATIVE, true);
+        if (source_output_nbytes > 0)
+            o->process_rewind(o, source_output_nbytes);
+
+        if (o->thread_info.resampler && length == 0) {
+            size_t resampler_bytes;
+
+            /* Round down to full frames */
+            resampler_bytes = (size_t) pa_resampler_get_delay(o->thread_info.resampler, false) * pa_frame_size(&o->source->sample_spec);
+            if (resampler_bytes > 0)
+                pa_memblockq_rewind(o->thread_info.delay_memblockq, resampler_bytes);
+
+            pa_resampler_rewind(o->thread_info.resampler, source_output_nbytes, NULL, 0);
+        }
+    }
+
+    pa_memblockq_seek(o->thread_info.delay_memblockq, - ((int64_t) nbytes), PA_SEEK_RELATIVE, true);
 }
 
 /* Called from thread context */
@@ -887,18 +909,25 @@ size_t pa_source_output_get_max_rewind(pa_source_output *o) {
     pa_source_output_assert_ref(o);
     pa_source_output_assert_io_context(o);
 
-    return o->thread_info.resampler ? pa_resampler_request(o->thread_info.resampler, o->source->thread_info.max_rewind) : o->source->thread_info.max_rewind;
+    return pa_resampler_result(o->thread_info.resampler, o->source->thread_info.max_rewind);
 }
 
 /* Called from thread context */
 void pa_source_output_update_max_rewind(pa_source_output *o, size_t nbytes  /* in the source's sample spec */) {
+    size_t resampler_history;
+
     pa_source_output_assert_ref(o);
     pa_source_output_assert_io_context(o);
     pa_assert(PA_SOURCE_OUTPUT_IS_LINKED(o->thread_info.state));
     pa_assert(pa_frame_aligned(nbytes, &o->source->sample_spec));
 
+    resampler_history = (uint64_t) PA_RESAMPLER_MAX_DELAY_USEC * o->source->sample_spec.rate / PA_USEC_PER_SEC;
+    resampler_history *= pa_frame_size(&o->source->sample_spec);
+
+    pa_memblockq_set_maxrewind(o->thread_info.delay_memblockq, resampler_history + nbytes);
+
     if (o->update_max_rewind)
-        o->update_max_rewind(o, o->thread_info.resampler ? pa_resampler_result(o->thread_info.resampler, nbytes) : nbytes);
+        o->update_max_rewind(o, pa_resampler_result(o->thread_info.resampler, nbytes));
 }
 
 /* Called from thread context */
@@ -1512,6 +1541,16 @@ static void update_volume_due_to_moving(pa_source_output *o, pa_source *dest) {
             pa_source_output_set_volume_direct(o, &o->reference_ratio);
             o->real_ratio = o->reference_ratio;
             pa_sw_cvolume_multiply(&o->soft_volume, &o->real_ratio, &o->volume_factor);
+
+            /* If this is a virtual source stream, we have to apply the source volume
+             * to the source output. */
+            if (o->destination_source) {
+                pa_cvolume vol;
+
+                vol = o->destination_source->real_volume;
+                pa_cvolume_remap(&vol, &o->destination_source->channel_map, &o->channel_map);
+                pa_source_output_set_volume(o, &vol, o->destination_source->save_volume, true);
+            }
         }
     }
 
@@ -1519,6 +1558,22 @@ static void update_volume_due_to_moving(pa_source_output *o, pa_source *dest) {
      * pa_source_set_volume(), which will do the rest of the updates. */
     if ((o->source == dest) && pa_source_flat_volume_enabled(o->source))
         pa_source_set_volume(o->source, NULL, false, o->save_volume);
+}
+
+/* Called from the main thread. */
+static void set_preferred_source(pa_source_output *o, const char *source_name) {
+    pa_assert(o);
+
+    if (pa_safe_streq(o->preferred_source, source_name))
+        return;
+
+    pa_log_debug("Source output %u: preferred_source: %s -> %s",
+                 o->index, o->preferred_source ? o->preferred_source : "(unset)", source_name ? source_name : "(unset)");
+    pa_xfree(o->preferred_source);
+    o->preferred_source = pa_xstrdup(source_name);
+
+    pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT | PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
+    pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_PREFERRED_SOURCE_CHANGED], o);
 }
 
 /* Called from main context */
@@ -1560,11 +1615,10 @@ int pa_source_output_finish_move(pa_source_output *o, pa_source *dest, bool save
     /* save == true, means user is calling the move_to() and want to
        save the preferred_source */
     if (save) {
-        pa_xfree(o->preferred_source);
         if (dest == dest->core->default_source)
-            o->preferred_source = NULL;
+            set_preferred_source(o, NULL);
         else
-            o->preferred_source = pa_xstrdup(dest->name);
+            set_preferred_source(o, dest->name);
     }
 
     pa_idxset_put(o->source->outputs, pa_source_output_ref(o), NULL);
@@ -1676,6 +1730,7 @@ int pa_source_output_process_msg(pa_msgobject *mo, int code, void *userdata, int
             pa_usec_t *r = userdata;
 
             r[0] += pa_bytes_to_usec(pa_memblockq_get_length(o->thread_info.delay_memblockq), &o->source->sample_spec);
+            r[0] += pa_resampler_get_delay_usec(o->thread_info.resampler);
             r[1] += pa_source_get_latency_within_thread(o->source, false);
 
             return 0;
@@ -1759,6 +1814,7 @@ finish:
 int pa_source_output_update_resampler(pa_source_output *o) {
     pa_resampler *new_resampler;
     char *memblockq_name;
+    size_t resampler_history;
 
     pa_source_output_assert_ref(o);
     pa_assert_ctl_context();
@@ -1815,6 +1871,11 @@ int pa_source_output_update_resampler(pa_source_output *o) {
             0,
             &o->source->silence);
     pa_xfree(memblockq_name);
+
+    resampler_history = (uint64_t) PA_RESAMPLER_MAX_DELAY_USEC * o->source->sample_spec.rate / PA_USEC_PER_SEC;
+    resampler_history *= pa_frame_size(&o->source->sample_spec);
+
+    pa_memblockq_set_maxrewind(o->thread_info.delay_memblockq, resampler_history + pa_source_get_max_rewind(o->source));
 
     o->actual_resample_method = new_resampler ? pa_resampler_get_method(new_resampler) : PA_RESAMPLER_INVALID;
 
@@ -1897,16 +1958,29 @@ void pa_source_output_set_reference_ratio(pa_source_output *o, const pa_cvolume 
                  pa_cvolume_snprint_verbose(new_ratio_str, sizeof(new_ratio_str), ratio, &o->channel_map, true));
 }
 
-/* Called from the main thread. */
+/* Called from the main thread.
+ *
+ * This is called when e.g. module-stream-restore wants to change the preferred
+ * source. As a side effect the stream is moved to the new preferred source.
+ * Note that things can work also in the other direction: if the user moves
+ * a stream, as a side effect the preferred source is changed. This could cause
+ * an infinite loop, but it's avoided by these two measures:
+ *   - When pa_source_output_set_preferred_source() is called, it calls
+ *     pa_source_output_move_to() with save=false, which avoids the recursive
+ *     pa_source_output_set_preferred_source() call.
+ *   - When the primary operation is to move a stream,
+ *     pa_source_output_finish_move() calls set_preferred_source() instead of
+ *     pa_source_output_set_preferred_source(). set_preferred_source() doesn't
+ *     move the stream as a side effect.
+ */
 void pa_source_output_set_preferred_source(pa_source_output *o, pa_source *s) {
     pa_assert(o);
 
-    pa_xfree(o->preferred_source);
     if (s) {
-        o->preferred_source = pa_xstrdup(s->name);
+        set_preferred_source(o, s->name);
         pa_source_output_move_to(o, s, false);
     } else {
-        o->preferred_source = NULL;
+        set_preferred_source(o, NULL);
         pa_source_output_move_to(o, o->core->default_source, false);
     }
 }

@@ -33,6 +33,13 @@
 
 #include "alsa-mixer.h"
 
+enum {
+    PA_ALSA_ERR_UNSPECIFIED = 1,
+    PA_ALSA_ERR_UCM_OPEN = 1000,
+    PA_ALSA_ERR_UCM_NO_VERB = 1001,
+    PA_ALSA_ERR_UCM_LINKED = 1002
+};
+
 int pa_alsa_set_hw_params(
         snd_pcm_t *pcm_handle,
         pa_sample_spec *ss,                /* modified at return */
@@ -60,6 +67,8 @@ snd_pcm_t *pa_alsa_open_by_device_id_auto(
         snd_pcm_uframes_t tsched_size,
         bool *use_mmap,                   /* modified at return */
         bool *use_tsched,                 /* modified at return */
+        pa_sample_format_t **query_supported_formats, /* modified at return */
+        unsigned int **query_supported_rates,         /* modified at return */
         pa_alsa_profile_set *ps,
         pa_alsa_mapping **mapping);       /* modified at return */
 
@@ -75,6 +84,8 @@ snd_pcm_t *pa_alsa_open_by_device_id_mapping(
         snd_pcm_uframes_t tsched_size,
         bool *use_mmap,                   /* modified at return */
         bool *use_tsched,                 /* modified at return */
+        pa_sample_format_t **query_supported_formats, /* modified at return */
+        unsigned int **query_supported_rates,         /* modified at return */
         pa_alsa_mapping *mapping);
 
 /* Opens the explicit ALSA device */
@@ -89,6 +100,8 @@ snd_pcm_t *pa_alsa_open_by_device_string(
         snd_pcm_uframes_t tsched_size,
         bool *use_mmap,                   /* modified at return */
         bool *use_tsched,                 /* modified at return */
+        pa_sample_format_t **query_supported_formats, /* modified at return */
+        unsigned int **query_supported_rates,         /* modified at return */
         bool require_exact_channel_number);
 
 /* Opens the explicit ALSA device with a fallback list */
@@ -104,6 +117,8 @@ snd_pcm_t *pa_alsa_open_by_template(
         snd_pcm_uframes_t tsched_size,
         bool *use_mmap,                   /* modified at return */
         bool *use_tsched,                 /* modified at return */
+        pa_sample_format_t **query_supported_formats, /* modified at return */
+        unsigned int **query_supported_rates,        /* modified at return */
         bool require_exact_channel_number);
 
 void pa_alsa_dump(pa_log_level_t level, snd_pcm_t *pcm);
@@ -141,7 +156,7 @@ const char* pa_alsa_strerror(int errnum);
 
 bool pa_alsa_may_tsched(bool want);
 
-snd_mixer_elem_t *pa_alsa_mixer_find_card(snd_mixer_t *mixer, const char *name, unsigned int device);
+snd_mixer_elem_t *pa_alsa_mixer_find_card(snd_mixer_t *mixer, struct pa_alsa_mixer_id *alsa_id, unsigned int device);
 snd_mixer_elem_t *pa_alsa_mixer_find_pcm(snd_mixer_t *mixer, const char *name, unsigned int device);
 
 snd_mixer_t *pa_alsa_open_mixer(pa_hashmap *mixers, int alsa_card_index, bool probe);

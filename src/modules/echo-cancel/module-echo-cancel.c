@@ -422,6 +422,9 @@ static int source_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t 
                 /* and the buffering we do on the source */
                 pa_bytes_to_usec(u->source_output_blocksize, &u->source_output->source->sample_spec);
 
+            /* Add resampler delay */
+            *((int64_t*) data) += pa_resampler_get_delay_usec(u->source_output->thread_info.resampler);
+
             return 0;
 
         case PA_SOURCE_MESSAGE_SET_VOLUME_SYNCED:
@@ -456,6 +459,9 @@ static int sink_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t of
 
                 /* Add the latency internal to our sink input on top */
                 pa_bytes_to_usec(pa_memblockq_get_length(u->sink_input->thread_info.render_memblockq), &u->sink_input->sink->sample_spec);
+
+            /* Add resampler delay */
+            *((int64_t*) data) += pa_resampler_get_delay_usec(u->sink_input->thread_info.resampler);
 
             return 0;
     }
@@ -1050,6 +1056,9 @@ static void source_output_snapshot_within_thread(struct userdata *u, struct snap
 
     now = pa_rtclock_now();
     latency = pa_source_get_latency_within_thread(u->source_output->source, false);
+    /* Add resampler delay */
+    latency += pa_resampler_get_delay_usec(u->source_output->thread_info.resampler);
+
     delay = pa_memblockq_get_length(u->source_output->thread_info.delay_memblockq);
 
     delay = (u->source_output->thread_info.resampler ? pa_resampler_request(u->source_output->thread_info.resampler, delay) : delay);
@@ -1129,6 +1138,9 @@ static int sink_input_process_msg_cb(pa_msgobject *obj, int code, void *data, in
 
             now = pa_rtclock_now();
             latency = pa_sink_get_latency_within_thread(u->sink_input->sink, false);
+            /* Add resampler delay */
+            latency += pa_resampler_get_delay_usec(u->sink_input->thread_info.resampler);
+
             delay = pa_memblockq_get_length(u->sink_input->thread_info.render_memblockq);
 
             delay = (u->sink_input->thread_info.resampler ? pa_resampler_request(u->sink_input->thread_info.resampler, delay) : delay);
@@ -2358,8 +2370,6 @@ int main(int argc, char* argv[]) {
     }
 
     u.ec->done(u.ec);
-    u.ec->msg->dead = true;
-    pa_echo_canceller_msg_unref(u.ec->msg);
 
 out:
     if (u.captured_file)

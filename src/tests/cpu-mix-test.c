@@ -76,7 +76,7 @@ static void run_mix_test(
     samples_ref = out_ref + (8 - align);
     nsamples = channels * (SAMPLES - (8 - align));
 
-    fail_unless((pool = pa_mempool_new(PA_MEM_TYPE_PRIVATE, 0, true)) != NULL, NULL);
+    fail_unless((pool = pa_mempool_new(PA_MEM_TYPE_PRIVATE, 0, true)) != NULL);
 
     pa_random(samples0, nsamples * sizeof(int16_t));
     c0.memblock = pa_memblock_new_fixed(pool, samples0, nsamples * sizeof(int16_t), false);
@@ -212,7 +212,6 @@ int main(int argc, char *argv[]) {
 #if defined (__arm__) && defined (__linux__) && defined (HAVE_NEON)
     tcase_add_test(tc, mix_neon_test);
 #endif
-    tcase_set_timeout(tc, 120);
     suite_add_tcase(s, tc);
 
     sr = srunner_create(s);

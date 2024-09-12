@@ -22,10 +22,8 @@
 #ifdef HAVE_PTHREAD
 #include <pthread.h>
 #ifdef HAVE_PTHREAD_SETAFFINITY_NP
-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
 #ifdef __FreeBSD__
 #include <pthread_np.h>
-#endif
 #include <sys/param.h>
 #include <sys/cpuset.h>
 #endif
@@ -63,7 +61,7 @@ static void thread_func(void *data) {
 
 #ifdef HAVE_PTHREAD_SETAFFINITY_NP
     static pa_atomic_t i_cpu = PA_ATOMIC_INIT(0);
-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+#ifdef __FreeBSD__
     cpuset_t mask;
 #else
     cpu_set_t mask;
@@ -134,10 +132,6 @@ int main(int argc, char *argv[]) {
     s = suite_create("Once");
     tc = tcase_create("once");
     tcase_add_test(tc, once_test);
-    /* the default timeout is too small,
-     * set it to a reasonable large one.
-     */
-    tcase_set_timeout(tc, 60 * 60);
     suite_add_tcase(s, tc);
 
     sr = srunner_create(s);

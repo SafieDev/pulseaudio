@@ -57,8 +57,8 @@ PA_MODULE_USAGE(
         "norewinds=<disable rewinds>");
 
 #define DEFAULT_SINK_NAME "null"
-#define BLOCK_USEC (PA_USEC_PER_SEC * 2)
-#define NOREWINDS_MAX_LATENCY_USEC (50*PA_USEC_PER_MSEC)
+#define BLOCK_USEC (2 * PA_USEC_PER_SEC)
+#define BLOCK_USEC_NOREWINDS (50 * PA_USEC_PER_MSEC)
 
 struct userdata {
     pa_core *core;
@@ -113,6 +113,25 @@ static int sink_process_msg(
 }
 
 /* Called from the IO thread. */
+static void sink_recalculate_max_request_and_rewind(pa_sink *s) {
+    struct userdata *u;
+    size_t nbytes;
+
+    pa_sink_assert_ref(s);
+    pa_assert_se(u = s->userdata);
+
+    nbytes = pa_usec_to_bytes(u->block_usec, &s->sample_spec);
+
+    if (u->norewinds) {
+        pa_sink_set_max_rewind_within_thread(s, 0);
+    } else {
+        pa_sink_set_max_rewind_within_thread(s, nbytes);
+    }
+
+    pa_sink_set_max_request_within_thread(s, nbytes);
+}
+
+/* Called from the IO thread. */
 static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state, pa_suspend_cause_t new_suspend_cause) {
     struct userdata *u;
 
@@ -120,16 +139,23 @@ static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state,
     pa_assert_se(u = s->userdata);
 
     if (s->thread_info.state == PA_SINK_SUSPENDED || s->thread_info.state == PA_SINK_INIT) {
-        if (PA_SINK_IS_OPENED(new_state))
+        if (PA_SINK_IS_OPENED(new_state)) {
             u->timestamp = pa_rtclock_now();
+
+            /* If sink was suspended to change sample formats, both
+             * thread_info.max_request and thread_info.max_rewind
+             * must be updated before first block is rendered
+             */
+            sink_recalculate_max_request_and_rewind(s);
+        }
     }
 
     return 0;
 }
 
+/* Called from the IO thread. */
 static void sink_update_requested_latency_cb(pa_sink *s) {
     struct userdata *u;
-    size_t nbytes;
 
     pa_sink_assert_ref(s);
     pa_assert_se(u = s->userdata);
@@ -139,15 +165,7 @@ static void sink_update_requested_latency_cb(pa_sink *s) {
     if (u->block_usec == (pa_usec_t) -1)
         u->block_usec = s->thread_info.max_latency;
 
-    nbytes = pa_usec_to_bytes(u->block_usec, &s->sample_spec);
-
-    if(u->norewinds){
-        pa_sink_set_max_rewind_within_thread(s, 0);
-    } else {
-        pa_sink_set_max_rewind_within_thread(s, nbytes);
-    }
-
-    pa_sink_set_max_request_within_thread(s, nbytes);
+    sink_recalculate_max_request_and_rewind(s);
 }
 
 static void sink_reconfigure_cb(pa_sink *s, pa_sample_spec *spec, bool passthrough) {
@@ -223,8 +241,12 @@ static void process_render(struct userdata *u, pa_usec_t now) {
     /* Fill the buffer up the latency size */
     while (u->timestamp < now + u->block_usec) {
         pa_memchunk chunk;
+        size_t request_size;
 
-        pa_sink_render(u->sink, u->sink->thread_info.max_request, &chunk);
+        request_size = pa_usec_to_bytes(now + u->block_usec - u->timestamp, &u->sink->sample_spec);
+        request_size = PA_MIN(request_size, u->sink->thread_info.max_request);
+        pa_sink_render(u->sink, request_size, &chunk);
+
         pa_memblock_unref(chunk.memblock);
 
 /*         pa_log_debug("Ate %lu bytes.", (unsigned long) chunk.length); */
@@ -318,6 +340,7 @@ int pa__init(pa_module*m) {
     u->core = m->core;
     u->module = m;
     u->rtpoll = pa_rtpoll_new();
+    u->block_usec = BLOCK_USEC;
 
     if (pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll) < 0) {
         pa_log("pa_thread_mq_init() failed.");
@@ -343,8 +366,10 @@ int pa__init(pa_module*m) {
 
             if (!format) {
                 pa_log(_("Failed to set format: invalid format string %s"), f);
+		pa_xfree(f);
                 goto fail;
             }
+            pa_xfree(f);
 
             pa_idxset_put(u->formats, format, NULL);
         }
@@ -379,12 +404,14 @@ int pa__init(pa_module*m) {
     pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
     pa_sink_set_rtpoll(u->sink, u->rtpoll);
 
-    u->block_usec = BLOCK_USEC;
-    nbytes = pa_usec_to_bytes(u->block_usec, &u->sink->sample_spec);
-
     if(pa_modargs_get_value_boolean(ma, "norewinds", &u->norewinds) < 0){
         pa_log("Invalid argument, norewinds expects a boolean value.");
     }
+
+    if (u->norewinds)
+        u->block_usec = BLOCK_USEC_NOREWINDS;
+
+    nbytes = pa_usec_to_bytes(u->block_usec, &u->sink->sample_spec);
 
     if(u->norewinds){
         pa_sink_set_max_rewind(u->sink, 0);
@@ -399,11 +426,7 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
-    if(u->norewinds){
-        pa_sink_set_latency_range(u->sink, 0, NOREWINDS_MAX_LATENCY_USEC);
-    } else {
-        pa_sink_set_latency_range(u->sink, 0, BLOCK_USEC);
-    }
+    pa_sink_set_latency_range(u->sink, 0, u->block_usec);
 
     pa_sink_put(u->sink);
 
