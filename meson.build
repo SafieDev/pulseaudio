@@ -165,7 +165,7 @@ cdata.set_quoted('PA_ALSA_PROFILE_SETS_DIR', join_paths(alsadatadir, 'profile-se
 cdata.set_quoted('DESKTOPFILEDIR', join_paths(datadir, 'applications'))
 cdata.set_quoted('PULSE_LOCALEDIR', localedir)
 cdata.set_quoted('GETTEXT_PACKAGE', 'pulseaudio')
-cdata.set('ENABLE_NLS', 1)
+cdata.set('ENABLE_NLS', 0)
 cdata.set('top_srcdir', meson.source_root())
 
 # Platform specifics
@@ -681,7 +681,7 @@ if get_option('daemon')
     cdata.set('HAVE_ALSA_UCM', 1)
   endif
 
-  gio_dep = dependency('gio-2.0', version : '>= 2.26.0')
+  gio_dep = dependency('gio-2.0', version : '>= 2.26.0', required : false)
   if get_option('gsettings').enabled()
     assert(gio_dep.found(), 'GSettings support needs glib I/O library (GIO)')
     cdata.set('HAVE_GSETTINGS', 1)
@@ -755,7 +755,7 @@ if get_option('daemon')
     cdata.set('HAVE_AVAHI', 0)
   endif
 
-  sbc_dep = dependency('sbc', version : '>= 1.0', required : false)
+  sbc_dep = dependency('sbc', version : '>= 1.0', required : true)
 
   bluez_dep = dependency('bluez', required : get_option('bluez5'))
 

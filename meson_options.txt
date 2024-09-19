@@ -5,16 +5,16 @@ option('client',
        type : 'boolean', value : true,
        description : 'Build and install pulseaudio client libraries and utilities')
 option('doxygen',
-       type : 'boolean', value : true,
+       type : 'boolean', value : false,
        description : 'Enable building and installation of documentation generated with doxygen')
 option('gcov',
        type : 'boolean', value : false,
        description : 'Enable optional gcov coverage analysis')
 option('man',
-       type : 'boolean',
+       type : 'boolean', value : false,
        description : 'Enable building and installation of man pages')
 option('tests',
-       type : 'boolean',
+       type : 'boolean', value : false,
        description : 'Enable unit tests')
 
 option('system_user',
@@ -24,10 +24,10 @@ option('system_group',
         type : 'string', value : 'pulse',
         description : 'Group for running the PulseAudio daemon as a system-wide instance (pulse)')
 option('access_group',
-        type : 'string', value : 'pulse-access',
+        type : 'string', value : 'pulse',
         description : 'Group which is allowed access to a system-wide PulseAudio daemon (pulse-access)')
 option('database',
-        type : 'combo', value : 'tdb',
+        type : 'combo', value : 'simple',
         choices : [ 'gdbm', 'tdb', 'simple' ],
         description : 'Database backend')
 option('legacy-database-entry-format',
@@ -100,7 +100,7 @@ option('bluez5-ofono-headset',
        type : 'boolean',
        description : 'Optional oFono headset backend support (BlueZ 5)')
 option('dbus',
-       type : 'feature', value : 'auto',
+       type : 'feature', value : 'enabled',
        description : 'Optional D-Bus support')
 option('elogind',
        type : 'feature', value : 'auto',
@@ -148,7 +148,7 @@ option('soxr',
        type : 'feature', value : 'auto',
        description : 'Optional SoXR support (resampling)')
 option('speex',
-       type : 'feature', value : 'auto',
+       type : 'feature', value : 'enabled',
        description : 'Optional Speex support (resampling, AEC)')
 option('systemd',
        type : 'feature', value : 'auto',
@@ -175,5 +175,5 @@ option('adrian-aec',
        type : 'boolean',
        description : 'Optional Adrian\'s echo canceller')
 option('webrtc-aec',
-       type : 'feature', value : 'auto',
+       type : 'feature', value : 'enabled',
        description : 'Optional WebRTC-based echo canceller')
